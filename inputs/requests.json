@@ -1,0 +1,29 @@
+{
+  "path-request": [
+    {
+      "request-id": "request_1",
+      "source": "trx_Site_A",
+      "destination": "trx_Site_C",
+      "src-tp-id": "trx_Site_A",
+      "dst-tp-id": "trx_Site_C",
+      "bidirectional": false,
+      "path-constraints": {
+        "te-bandwidth": {
+          "technology": "flexi-grid",
+          "trx_type": "200G",
+          "trx_mode": "DP-16QAM",
+          "effective-freq-slot": [
+            {
+              "N": "null",
+              "M": "null"
+            }
+          ],
+          "spacing": 50000000000.0,
+          "max-nb-of-channel": "null",
+          "output-power": "null",
+          "path_bandwidth": 200000000000.0
+        }
+      }
+    }
+  ]
+}

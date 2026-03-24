@@ -1,0 +1,34 @@
+# GNPy Simulator - Streamlit Web Application
+# Python Package Requirements
+
+# Core Dependencies (Required)
+streamlit>=1.31.0
+
+# Data Processing (Required)
+pandas>=2.0.0
+numpy>=1.24.0
+openpyxl>=3.1.0
+
+# Network Graph and Visualization (Required)
+networkx>=3.0
+matplotlib>=3.7.0
+plotly>=5.18.0
+
+# File Handling (Required)
+python-json-logger>=2.0.7
+pyyaml>=6.0
+
+# Optional: For advanced features
+scipy>=1.11.0
+
+# Optional: GNPy Library
+# Note: GNPy requires CMake and C++ build tools on Windows
+# The application works with mock data if GNPy is not installed
+# 
+# To install GNPy (optional):
+#   1. Install CMake: https://cmake.org/download/
+#   2. Install Visual Studio Build Tools or Visual Studio
+#   3. Run: pip install gnpy
+#
+# Uncomment the line below if you have build tools installed:
+# gnpy>=2.9.0

@@ -1,0 +1,72 @@
+{
+  "elements": [
+    {
+      "uid": "trx_Site_A",
+      "type": "Transceiver"
+    },
+    {
+      "uid": "roadm_Site_A",
+      "type": "ROADM"
+    },
+    {
+      "uid": "ILA_1",
+      "type": "ILA"
+    },
+    {
+      "uid": "roadm_Site_B",
+      "type": "ROADM"
+    },
+    {
+      "uid": "ILA_2",
+      "type": "ILA"
+    },
+    {
+      "uid": "roadm_Site_C",
+      "type": "ROADM"
+    },
+    {
+      "uid": "trx_Site_C",
+      "type": "Transceiver"
+    },
+    {
+      "type": "Fiber",
+      "from": "trx_Site_A",
+      "to": "roadm_Site_A",
+      "length": 0.01
+    },
+    {
+      "type": "Fiber",
+      "from": "roadm_Site_A",
+      "to": "ILA_1",
+      "length": 80.0,
+      "type_variety": "SSMF"
+    },
+    {
+      "type": "Fiber",
+      "from": "ILA_1",
+      "to": "roadm_Site_B",
+      "length": 80.0,
+      "type_variety": "SSMF"
+    },
+    {
+      "type": "Fiber",
+      "from": "roadm_Site_B",
+      "to": "ILA_2",
+      "length": 80.0,
+      "type_variety": "SSMF"
+    },
+    {
+      "type": "Fiber",
+      "from": "ILA_2",
+      "to": "roadm_Site_C",
+      "length": 80.0,
+      "type_variety": "SSMF"
+    },
+    {
+      "type": "Fiber",
+      "from": "roadm_Site_C",
+      "to": "trx_Site_C",
+      "length": 0.01
+    }
+  ]
+}

@@ -1,0 +1,567 @@
+on:
+  push:
+  pull_request:
+
+name: CI
+
+jobs:
+  build:
+    name: 'Build: ${{ matrix.name }}'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "Ubuntu 22.04 Python 3.10"
+            os: ubuntu-22.04
+            build_type: Release
+            generators: Ninja
+            python-version: "3.10"
+
+          - name: "Ubuntu 22.04 Python 3.11"
+            os: ubuntu-22.04
+            build_type: Release
+            generators: Ninja
+            wheel: manylinux_2_35_x86_64
+            python-version: "3.11"
+
+          - name: "Ubuntu 22.04 Python 3.12"
+            os: ubuntu-22.04
+            build_type: Release
+            generators: Ninja
+            wheel: manylinux_2_35_x86_64
+            python-version: "3.12"
+            upload-sdist: true
+
+          - name: "Ubuntu 20.04 with GCC 10 Python 3.8"
+            os: ubuntu-20.04
+            build_type: Release
+            generators: Ninja
+            wheel: manylinux_2_31_x86_64
+            python-version: "3.8"
+
+          - name: "Ubuntu 20.04 with GCC 10 Python 3.9"
+            os: ubuntu-20.04
+            build_type: Release
+            generators: Ninja
+            wheel: manylinux_2_31_x86_64
+            python-version: "3.9"
+
+          - name: "Ubuntu 20.04 with GCC 10 Python 3.10"
+            os: ubuntu-20.04
+            build_type: Release
+            generators: Ninja
+            wheel: manylinux_2_31_x86_64
+            python-version: "3.10"
+
+          - name: "Windows 2022 MSVC Python 3.10"
+            os: windows-2022
+            triplet: x64-windows
+            build_type: Release
+            generators: "Visual Studio 17 2022"
+            wheel: win_amd64
+            python-version: "3.10"
+
+          - name: "Windows 2022 MSVC Python 3.11"
+            os: windows-2022
+            triplet: x64-windows
+            build_type: Release
+            generators: "Visual Studio 17 2022"
+            wheel: win_amd64
+            python-version: "3.11"
+
+          - name: "Windows 2022 MSVC Python 3.12"
+            os: windows-2022
+            triplet: x64-windows
+            build_type: Release
+            generators: "Visual Studio 17 2022"
+            wheel: win_amd64
+            python-version: "3.12"
+
+          - name: "macOS 15 x86_64 x86_64 Python 3.13"
+            os: macos-15-large
+            build_type: Release
+            generators: Ninja
+            wheel: macosx_15_0_x86_64
+            python-version: "3.13"
+
+          - name: "macOS 15 arm64 Python 3.13"
+            os: macos-15-xlarge
+            build_type: Release
+            generators: Ninja
+            wheel: macosx_15_0_arm64
+            python-version: "3.13"
+
+    steps:
+      - name: Unix line endings in git
+        if: startsWith(matrix.os, 'windows') || startsWith(matrix.os, 'macos')
+        run: |
+          git config --global core.autocrlf input
+          git config --global core.eol lf
+
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Get number of CPU cores
+        id: cpu-cores
+        uses: SimenB/github-actions-cpu-cores@410541432439795d30db6501fb1d8178eb41e502
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Extract VCPKG version
+        if: startsWith(matrix.os, 'windows')
+        id: extract-vcpkg-version
+        shell: bash
+        run: |
+          cd ${VCPKG_INSTALLATION_ROOT//\\//}
+          echo "echo VCPKG_PATH=$VCPKG_INSTALLATION_ROOT" >> $GITHUB_OUTPUT
+          echo "VCPKG_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          # cd '${{ github.workspace }}/'libyang
+          # echo "LIBYANG_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          # cd '${{ github.workspace }}/'libyang-cpp
+          # echo "LIBYANG_CPP_COMMIT=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      # Unfortunately, this is broken due to dlfcn-win32 assuming that "debug" is always there:
+      # (the last item at https://github.com/microsoft/vcpkg/issues/6045)
+      # Fixed via https://github.com/microsoft/vcpkg/pull/25278
+      # But then bzip2 also fails...
+      # - name: Slim down VCPKG builds
+      #   if: startsWith(matrix.os, 'windows')
+      #   shell: bash
+      #   run: echo 'set(VCPKG_BUILD_TYPE "${{ matrix.build_type }}")' >> ${VCPKG_INSTALLATION_ROOT//\\//}/triplets/${{ matrix.triplet }}.cmake
+
+      - name: Cache VCPKG
+        if: startsWith(matrix.os, 'windows')
+        id: cache-vcpkg
+        uses: actions/cache@v3
+        with:
+          path: '${{ steps.extract-vcpkg-version.outputs.VCPKG_PATH }}/installed'
+          key: 'vcpkg-3-${{ matrix.os }}-${{ matrix.build_type }}-${{ matrix.triplet }}-${{ steps.extract-vcpkg-version.outputs.VCPKG_COMMIT }}'
+
+      - name: Configure Windows PATH
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          echo '${{ github.workspace }}/'../target/bin >> $GITHUB_PATH
+          echo '${{ github.workspace }}/'../target/lib >> $GITHUB_PATH
+          echo 'C:/Program Files/Microsoft Visual Studio/2022/Enterprise/SDK/ScopeCppSDK/vc15/VC/bin' >> $GITHUB_PATH
+          echo ${VCPKG_INSTALLATION_ROOT//\\//}'/installed/${{ matrix.triplet }}/bin' >> $GITHUB_PATH
+          echo EXTRA_VCPKG_TARGET_TRIPLET=-DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }} >> $GITHUB_ENV
+          echo EXTRA_CMAKE_TOOLCHAIN_FILE=-DCMAKE_TOOLCHAIN_FILE=${VCPKG_INSTALLATION_ROOT//\\//}/scripts/buildsystems/vcpkg.cmake >> $GITHUB_ENV
+          echo EXTRA_PKG_CONFIG_EXECUTABLE=-DPKG_CONFIG_EXECUTABLE=${VCPKG_INSTALLATION_ROOT//\\//}/installed/${{ matrix.triplet }}/tools/pkgconf/pkgconf.exe >> $GITHUB_ENV
+          echo PKG_CONFIG_PATH="${VCPKG_INSTALLATION_ROOT//\\//}/installed/${{ matrix.triplet }}/lib/pkgconfig;${GITHUB_WORKSPACE//\\//}/../target/lib/pkgconfig" >> $GITHUB_ENV
+          echo TMPDIR=C:\\t >> $GITHUB_ENV
+          echo TEMP=C:\\t >> $GITHUB_ENV
+          echo TMP=C:\\t >> $GITHUB_ENV
+
+      - name: Prepare Windows temp
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          mkdir -p ${TMPDIR//\\//}
+
+      - name: Configure Windows CXXFLAGS
+        if: startsWith(matrix.os, 'windows')
+        shell: bash
+        run: |
+          echo CXXFLAGS=" /wd4251 /wd4275" >> $GITHUB_ENV
+
+      - name: GCC 10 on Ubuntu 20.04
+        if: matrix.os == 'ubuntu-20.04'
+        shell: bash
+        run: |
+          echo CC=gcc-10 >> $GITHUB_ENV
+          echo CXX=g++-10 >> $GITHUB_ENV
+
+      - name: GCC 14 on Mac OS 15
+        if: startsWith(matrix.os, 'macos-13')
+        shell: bash
+        run: |
+          echo CC=gcc-14 >> $GITHUB_ENV
+          echo CXX=g++-14 >> $GITHUB_ENV
+
+      - name: Mac OS 15 deployment target
+        if: startsWith(matrix.os, 'macos-15')
+        shell: bash
+        run: |
+          echo MACOSX_DEPLOYMENT_TARGET=15.0 >> $GITHUB_ENV
+
+      - name: Mac OS ARCHFLAGS x86_64
+        if: startsWith(matrix.os, 'macos') && endsWith(matrix.wheel, '_x86_64')
+        shell: bash
+        run: |
+          set -ex
+          # This is for libyang and libyang-cpp which are directly built via cmake
+          echo EXTRA_OSX_ARCH=-DCMAKE_OSX_ARCHITECTURES=x86_64 >> $GITHUB_ENV
+          # Ensure that our setuptools extension knows what to pass to cmake
+          echo ARCHFLAGS="-arch x86_64" >> $GITHUB_ENV
+          # Correct platform tag in the wheel
+          # https://github.com/pypa/setuptools/issues/2520
+          # https://github.com/pypa/wheel/issues/406
+          # sed:
+          # - version needs replacing the underscore by a dot
+          # - then replace these underscores around the version with a minus
+          # - but don't replace the underscore in "x86_64"
+          # - and of course this is a Mac, so there's this FreeBSD-5.0-ish sed, not the GNU one
+          echo _PYTHON_HOST_PLATFORM=$(echo ${{ matrix.wheel }} | sed -E 's/(macosx)_([[:digit:]]+)_([[:digit:]]+)_/\1-\2.\3-/') >> $GITHUB_ENV
+
+      - name: Mac OS ARCHFLAGS arm64
+        if: startsWith(matrix.os, 'macos') && endsWith(matrix.wheel, '_arm64')
+        shell: bash
+        run: |
+          echo EXTRA_OSX_ARCH=-DCMAKE_OSX_ARCHITECTURES=arm64 >> $GITHUB_ENV
+          echo ARCHFLAGS="-arch arm64" >> $GITHUB_ENV
+          echo _PYTHON_HOST_PLATFORM=$(echo ${{ matrix.wheel }} | sed -E 's/(macosx)_([[:digit:]]+)_([[:digit:]]+)_/\1-\2.\3-/') >> $GITHUB_ENV
+
+      - name: Configure Linux paths
+        if: startsWith(matrix.os, 'ubuntu')
+        shell: bash
+        run: |
+          realpath -m ${{ github.workspace }}/../target/bin >> $GITHUB_PATH
+          echo LD_LIBRARY_PATH=$(realpath -m ${{ github.workspace }}/../target/lib):$(realpath -m ${{ github.workspace }}/../target/lib64) >> $GITHUB_ENV
+          echo PKG_CONFIG_PATH="$(realpath -m ${{ github.workspace }}/../target)/lib/pkgconfig" >> $GITHUB_ENV
+
+      - name: Configure Mac OS paths
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          echo ${{ github.workspace }}/../target/bin >> $GITHUB_PATH
+          echo REPAIR_LIBRARY_PATH=${{ github.workspace }}/../target/lib >> $GITHUB_ENV
+          echo PKG_CONFIG_PATH=${{ github.workspace }}/../target/lib/pkgconfig >> $GITHUB_ENV
+
+      # FIXME: CMake 4.0 is backwards-incompatible, https://github.com/actions/runner-images/issues/11926
+      - name: pin CMake to the latest 3.x series
+        uses: jwlawson/actions-setup-cmake@09fd9b0fb3b239b4b68d9256cd65adf8d6b91da0
+        if: startsWith(matrix.os, 'windows')
+        with:
+          cmake-version: '3.31.6'
+
+      - name: Install Windows dependencies
+        if: >
+          startsWith(matrix.os, 'windows') &&
+          (steps.cache-vcpkg.outputs.cache-hit != 'true')
+        run: vcpkg install --triplet=${{ matrix.triplet }} pcre2 pthreads dirent dlfcn-win32 cmocka getopt doctest pkgconf
+
+      - name: Install Linux dependencies
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt install -y libpcre2-dev libcmocka-dev doctest-dev ninja-build
+
+      - name: Install macOS dependencies
+        if: startsWith(matrix.os, 'macos')
+        run: brew install pcre2 cmocka doctest ninja tcl-tk
+
+      # Ubuntu 20.04: the system pybind11 is too old (unspecified reasons, commit 3a458f23)
+      # Ubuntu 22.04: the system pybind11 doesn't work with non-system Python 3.11:
+      # pybind11/detail/type_caster_base.h:482:26: error: invalid use of incomplete type ‘PyFrameObject’ {aka ‘struct _frame’}
+      # Windows: pybind11 by vcpkg won't work for any other version of Python by design, https://github.com/microsoft/vcpkg/issues/23796
+      - name: Install pybind11 (Unix)
+        if: startsWith(matrix.os, 'ubuntu') || startsWith(matrix.os, 'macos')
+        run: sudo pip install pybind11[global]
+
+      - name: Install pybind11 (Windows)
+        if: startsWith(matrix.os, 'windows')
+        run: pip install pybind11[global]
+
+      - name: configure libyang
+        shell: bash
+        run: |
+          cmake \
+            -S '${{ github.workspace }}/'libyang \
+            -B '${{ github.workspace }}/'../build-libyang \
+            -G '${{ matrix.generators }}' \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            ${EXTRA_VCPKG_TARGET_TRIPLET:+${EXTRA_VCPKG_TARGET_TRIPLET}} \
+            ${EXTRA_CMAKE_TOOLCHAIN_FILE:+${EXTRA_CMAKE_TOOLCHAIN_FILE}} \
+            ${EXTRA_OSX_ARCH:+${EXTRA_OSX_ARCH}} \
+            ${EXTRA_OSX_LIBYANG:+${EXTRA_OSX_LIBYANG}} \
+            -DENABLE_TESTS=ON \
+            -DCMAKE_INSTALL_PREFIX:PATH='${{ github.workspace }}/'../target
+
+      - name: build libyang
+        working-directory: '${{ github.workspace }}/../build-libyang'
+        run: cmake --build . -j${{ steps.cpu-cores.outputs.count }} --config ${{ matrix.build_type }}
+
+      - name: test libyang
+        working-directory: '${{ github.workspace }}/../build-libyang'
+        run: ctest --output-on-failure -j${{ steps.cpu-cores.outputs.count }} --build-config ${{ matrix.build_type }}
+
+      - name: install libyang
+        working-directory: '${{ github.workspace }}/../build-libyang'
+        run: cmake --install . --strip
+
+      # - name: test the installed yanglint
+      #   run: yanglint -f tree ${{ github.workspace }}/libyang/tests/modules/yang/ietf-interfaces@2014-05-08.yang
+
+      - name: configure libyang-cpp
+        shell: bash
+        run: |
+          set -ex
+          cmake \
+            -S '${{ github.workspace }}/'libyang-cpp \
+            -B '${{ github.workspace }}/'../build-libyang-cpp \
+            -G '${{ matrix.generators }}' \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            ${EXTRA_VCPKG_TARGET_TRIPLET:+${EXTRA_VCPKG_TARGET_TRIPLET}} \
+            ${EXTRA_CMAKE_TOOLCHAIN_FILE:+${EXTRA_CMAKE_TOOLCHAIN_FILE}} \
+            ${EXTRA_OSX_ARCH:+${EXTRA_OSX_ARCH}} \
+            ${EXTRA_PKG_CONFIG_EXECUTABLE:+${EXTRA_PKG_CONFIG_EXECUTABLE}} \
+            -DCMAKE_PREFIX_PATH:PATH=${GITHUB_WORKSPACE//\\//}/../target \
+            -DCMAKE_INSTALL_PREFIX:PATH='${{ github.workspace }}/'../target
+
+      - name: build libyang-cpp
+        working-directory: '${{ github.workspace }}/../build-libyang-cpp'
+        run: cmake --build . -j${{ steps.cpu-cores.outputs.count }} --config ${{ matrix.build_type }}
+
+      - name: test libyang-cpp
+        working-directory: '${{ github.workspace }}/../build-libyang-cpp'
+        run: ctest --output-on-failure -j${{ steps.cpu-cores.outputs.count }} --build-config ${{ matrix.build_type }}
+
+      - name: install libyang-cpp
+        working-directory: '${{ github.workspace }}/../build-libyang-cpp'
+        run: cmake --install . --strip
+
+      - name: quick install pytest for the test suite
+        if: startsWith(matrix.os, 'ubuntu-22')
+        run: pip install pytest
+
+      - name: quick configure oopt-gnpy-libyang
+        if: startsWith(matrix.os, 'ubuntu-22')
+        shell: bash
+        run: |
+          set -ex
+          cmake \
+            -DSHOW_SO_DEPENDENCIES=ON \
+            -DDONT_WARN_ABOUT_SETUP_PY=ON \
+            -S '${{ github.workspace }}/' \
+            -B '${{ github.workspace }}/'../build-oopt-gnpy-libyang \
+            -G '${{ matrix.generators }}' \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            ${EXTRA_VCPKG_TARGET_TRIPLET:+${EXTRA_VCPKG_TARGET_TRIPLET}} \
+            ${EXTRA_CMAKE_TOOLCHAIN_FILE:+${EXTRA_CMAKE_TOOLCHAIN_FILE}} \
+            ${EXTRA_OSX_ARCH:+${EXTRA_OSX_ARCH}} \
+            ${EXTRA_PKG_CONFIG_EXECUTABLE:+${EXTRA_PKG_CONFIG_EXECUTABLE}} \
+            -DCMAKE_PREFIX_PATH:PATH=${GITHUB_WORKSPACE//\\//}/../target \
+            -DCMAKE_INSTALL_PREFIX:PATH='${{ github.workspace }}/'../target
+
+      - name: quick build oopt-gnpy-libyang
+        if: startsWith(matrix.os, 'ubuntu-22')
+        working-directory: '${{ github.workspace }}/../build-oopt-gnpy-libyang'
+        run: cmake --build . -j${{ steps.cpu-cores.outputs.count }} --config ${{ matrix.build_type }}
+
+      - name: quick install oopt-gnpy-libyang
+        if: startsWith(matrix.os, 'ubuntu-22')
+        working-directory: '${{ github.workspace }}/../build-oopt-gnpy-libyang'
+        run: cmake --install . --strip
+
+      - name: quick test oopt-gnpy-libyang
+        if: startsWith(matrix.os, 'ubuntu-22')
+        working-directory: '${{ github.workspace }}/../build-oopt-gnpy-libyang'
+        run: ctest --output-on-failure -j${{ steps.cpu-cores.outputs.count }} --build-config ${{ matrix.build_type }}
+
+      - name: prepare wheel building
+        run: pip install wheel setuptools build setuptools_scm[toml]
+
+      - name: show Python version
+        run: python --version
+
+      - name: show Python3 version
+        run: python3 --version
+
+      - name: show pip version
+        run: pip --version
+
+      # Don't pass neither --sdist nor --wheel, which means "build sdist and from that, build the wheel". Oh well.
+      - name: build the sdist and wheel
+        shell: bash
+        run: |
+          set -ex
+          export CMAKE_ARGS="${EXTRA_VCPKG_TARGET_TRIPLET:+${EXTRA_VCPKG_TARGET_TRIPLET} }${EXTRA_CMAKE_TOOLCHAIN_FILE:+${EXTRA_CMAKE_TOOLCHAIN_FILE} }${EXTRA_PKG_CONFIG_EXECUTABLE:+${EXTRA_PKG_CONFIG_EXECUTABLE}}"
+          python3 -m build --skip-dependency-check --outdir '${{ github.workspace }}'/build-wheel '${{ github.workspace }}/'
+
+      - name: fix the wheel, Ubuntu 20.x
+        if: startsWith(matrix.os, 'ubuntu-20') && (matrix.wheel != '')
+        shell: bash
+        run: |
+          # we're on old Ubuntu to use an old manylinux tag, and newer auditwheel requires too fresh patchelf
+          pip install 'auditwheel<5.2.0'
+          find '${{ github.workspace }}'/build-wheel -name '*.whl'
+          auditwheel repair --plat '${{ matrix.wheel }}' '${{ github.workspace }}'/build-wheel/*.whl
+
+      - name: fix the wheel, Ubuntu 22.x
+        if: startsWith(matrix.os, 'ubuntu-22') && (matrix.wheel != '')
+        shell: bash
+        run: |
+          pip install auditwheel
+          find '${{ github.workspace }}'/build-wheel -name '*.whl'
+          auditwheel repair --plat '${{ matrix.wheel }}' '${{ github.workspace }}'/build-wheel/*.whl
+
+      - name: fix the wheel, Windows
+        if: startsWith(matrix.os, 'windows') && (matrix.wheel != '')
+        shell: bash
+        run: |
+          pip install delvewheel
+          delvewheel show '${{ github.workspace }}'/build-wheel/*.whl
+          delvewheel repair '${{ github.workspace }}'/build-wheel/*.whl
+
+      - name: fix the wheel, Mac OS
+        if: startsWith(matrix.os, 'macos') && (matrix.wheel != '')
+        shell: bash
+        run: |
+          pip install delocate
+          DYLD_LIBRARY_PATH=${REPAIR_LIBRARY_PATH} delocate-listdeps --all '${{ github.workspace }}'/build-wheel/*.whl
+          DYLD_LIBRARY_PATH=${REPAIR_LIBRARY_PATH} delocate-wheel -w ${{ github.workspace }}/wheelhouse -v '${{ github.workspace }}'/build-wheel/*.whl
+          # https://github.com/pypa/cibuildwheel/blob/main/docs/faq.md#macos-passing-dyld_library_path-to-delocate
+
+      - name: upload the wheel
+        if: matrix.wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: 'wheel-${{ matrix.wheel }}-${{ matrix.python-version }}'
+          path: |
+            ${{ github.workspace }}/wheelhouse/*.whl
+          if-no-files-found: error
+
+      - name: upload the sdist
+        if: matrix.upload-sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: |
+            ${{ github.workspace }}/build-wheel/*.tar.gz
+          if-no-files-found: error
+
+  test:
+    needs: build
+    name: 'Test: ${{ matrix.name }}'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "Ubuntu 22.04 Python 3.10"
+            os: ubuntu-22.04
+            python-version: "3.10"
+            wheel: manylinux_2_31_x86_64
+
+          - name: "Ubuntu 22.04 Python 3.11"
+            os: ubuntu-22.04
+            python-version: "3.11"
+            wheel: manylinux_2_35_x86_64
+
+          - name: "Ubuntu 22.04 Python 3.12"
+            os: ubuntu-22.04
+            python-version: "3.12"
+            wheel: manylinux_2_35_x86_64
+
+          - name: "Ubuntu 20.04 with GCC 10 Python 3.8"
+            os: ubuntu-20.04
+            wheel: manylinux_2_31_x86_64
+            python-version: "3.8"
+
+          - name: "Ubuntu 20.04 with GCC 10 Python 3.9"
+            os: ubuntu-20.04
+            wheel: manylinux_2_31_x86_64
+            python-version: "3.9"
+
+          - name: "Ubuntu 20.04 with GCC 10 Python 3.10"
+            os: ubuntu-20.04
+            wheel: manylinux_2_31_x86_64
+            python-version: "3.10"
+
+          - name: "Windows 2019 MSVC Python 3.10"
+            os: windows-2019
+            wheel: win_amd64
+            python-version: "3.10"
+
+          - name: "Windows 2022 MSVC Python 3.10"
+            os: windows-2022
+            wheel: win_amd64
+            python-version: "3.10"
+
+          - name: "Windows 2022 MSVC Python 3.11"
+            os: windows-2022
+            wheel: win_amd64
+            python-version: "3.11"
+
+          - name: "Windows 2022 MSVC Python 3.12"
+            os: windows-2022
+            wheel: win_amd64
+            python-version: "3.12"
+
+          - name: "macOS 15 x86_64 Python 3.13"
+            os: macos-15-large
+            wheel: macosx_15_0_x86_64
+            python-version: "3.13"
+
+          - name: "macOS 13 arm64 Python 3.13"
+            os: macos-15-xlarge
+            wheel: macosx_15_0_arm64
+            python-version: "3.13"
+
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: mkdir wheelhouse
+        shell: bash
+        run: |
+          mkdir ${GITHUB_WORKSPACE//\\//}/wheelhouse
+
+      - name: download the wheel
+        uses: actions/download-artifact@v4
+        id: download-wheel
+        with:
+          name: 'wheel-${{ matrix.wheel }}-${{ matrix.python-version }}'
+          path: ${{ github.workspace }}/wheelhouse
+
+      - name: install the wheel
+        shell: bash
+        run: |
+          pip install --only-binary :all: --no-index --find-links=${GITHUB_WORKSPACE//\\//}/wheelhouse oopt-gnpy-libyang
+
+      - name: install pytest
+        run: pip install pytest
+
+      - name: run pytest
+        working-directory: ${{ github.workspace }}
+        run: pytest -vv
+
+  upload:
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && github.repository_owner == 'Telecominfraproject' }}
+    needs:
+      - build
+      - test
+    name: Upload to PyPI
+    runs-on: ubuntu-22.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/oopt-gnpy-libyang
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ github.workspace }}/all-artifacts
+
+      - name: rearrange the wheels
+        run: |
+          set -ex
+          mkdir pypi
+          mv -v ${{ github.workspace }}/all-artifacts/*/* pypi/
+
+      - name: upload to pypi
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          user: __token__
+          packages-dir: pypi/
