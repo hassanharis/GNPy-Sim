@@ -4,15 +4,24 @@ Streamlit application for optical network simulation
 """
 
 import json
+from copy import deepcopy
 from pathlib import Path
+from typing import Any
 import pandas
 import streamlit as st
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from numpy import mean
+import numpy as np
 import networkx as nx
 import sys
 
 import pandas as pd
+
+BASE_DIR = Path(__file__).resolve().parent
+OOPT_GNPY_DIR = BASE_DIR / "oopt-gnpy"
+if OOPT_GNPY_DIR.exists() and str(OOPT_GNPY_DIR) not in sys.path:
+    sys.path.insert(0, str(OOPT_GNPY_DIR))
 
 # GNPy imports (after path fix)
 from gnpy.core.elements import Transceiver, Roadm, Fiber, RamanFiber, Edfa, Fused
@@ -33,6 +42,9 @@ sys.path.append(r"C:\Users\hahassan\OneDrive - Nokia\Work & Data\Software\My Lib
 
 from my_math import haversine_distance
 
+# Custom Input Generator module
+from app_CustomInputGenerator import custom_input_generator_ui, set_base_dir
+
 # Page configuration 
 st.set_page_config(
     page_title="GNPy Network Viewer",
@@ -44,7 +56,6 @@ st.set_page_config(
 st.sidebar.title("⚙️ Configuration")
 
 # File paths
-BASE_DIR = Path(__file__).resolve().parent
 input_topology = str(BASE_DIR / "inputs" / "topology.json")
 input_equipment = str(BASE_DIR / "inputs" / "eqpt_config.json")
 input_requests = str(BASE_DIR / "inputs" / "requests.json")
@@ -86,6 +97,12 @@ if 'simulation_results' not in st.session_state:
     st.session_state.simulation_results = None
 if 'transmission_results' not in st.session_state:
     st.session_state.transmission_results = None
+if 'along_path' not in st.session_state:
+    st.session_state.along_path = None
+if 'power_opt' not in st.session_state:
+    st.session_state.power_opt = None
+if 'power_opt_error' not in st.session_state:
+    st.session_state.power_opt_error = None
 if 'simulation_error' not in st.session_state:
     st.session_state.simulation_error = None
    
@@ -158,6 +175,58 @@ def transmission_results_to_dfs(results_dict=st.session_state.transmission_resul
     scalar_df = pd.DataFrame([scalar_cols]) if scalar_cols else pd.DataFrame()
 
     return summary_df, scalar_df, channel_df
+
+
+def compute_along_path_snapshots(equipment, network, req):
+    """Re-propagate the request element by element along the computed path and record the
+    accumulated per-channel spectrum (power, OSNR-ASE, SNR-NLI, GSNR) after each element.
+
+    Returns a dict with the ordered path elements and a list of per-element snapshots, each of
+    which holds the channel frequencies (THz) and per-channel metrics (dB / dBm) at that point.
+    """
+    from gnpy.core.info import create_input_spectral_information, carriers_to_spectral_information
+    from gnpy.topology.request import filter_si
+
+    path = compute_constrained_path(network, req)
+
+    if getattr(req, 'initial_spectrum', None) is not None:
+        si = carriers_to_spectral_information(initial_spectrum=req.initial_spectrum, power=req.power)
+    else:
+        si = create_input_spectral_information(
+            f_min=req.f_min, f_max=req.f_max, roll_off=req.roll_off, baud_rate=req.baud_rate,
+            spacing=req.spacing, tx_osnr=req.tx_osnr, tx_power=req.tx_power, delta_pdb=req.offset_db)
+    si = filter_si(path, equipment, si)
+
+    def _arr(values):
+        return np.asarray(values, dtype=float).tolist()
+
+    snapshots = []
+    cumulative_km = 0.0
+    for i, el in enumerate(path):
+        if isinstance(el, Roadm):
+            si = el(si, degree=path[i + 1].uid, from_degree=path[i - 1].uid)
+        else:
+            si = el(si)
+
+        if isinstance(el, (Fiber, RamanFiber)):
+            cumulative_km += float(getattr(el.params, 'length', 0.0)) / 1000.0
+
+        snapshots.append({
+            'index': i,
+            'uid': el.uid,
+            'type': type(el).__name__,
+            'cumulative_km': round(cumulative_km, 3),
+            'frequency_thz': _arr(np.asarray(si.frequency) * 1e-12),
+            'pch_dbm': _arr(si.pch_dbm),
+            'osnr_ase_db': _arr(si.snr_lin_db),
+            'snr_nli_db': _arr(si.snr_nli_db),
+            'gsnr_db': _arr(si.gsnr_db),
+        })
+
+    return {
+        'path_elements': [el.uid for el in path],
+        'snapshots': snapshots,
+    }
 
 
 def run_transmission(equipment, network, source, destination, launch_power, trx_type, bidir, margin, baudrate, rolloff, tx_osnr, min_osnr, spacing, min_freq, max_freq, roadm_osnr, pwr_start, pwr_stop, pwr_step, nodes_l=None, loose_l=None):
@@ -263,11 +332,107 @@ def run_transmission(equipment, network, source, destination, launch_power, trx_
             'tx_osnr': tx_osnr,
             'tx_power': tx_power,       
         }
+
         st.session_state.simulation_error = None
+
+        try:
+            st.session_state.along_path = compute_along_path_snapshots(equipment, network, req)
+        except Exception as e:
+            st.session_state.along_path = None
+            st.session_state.along_path_error = f"Along-path capture failed: {e}"
+        else:
+            st.session_state.along_path_error = None
     except Exception as e:
         st.session_state.simulation_results = {'success': False}
+        st.session_state.along_path = None
         st.session_state.simulation_error = str(e)
 
+
+def run_power_optimization(equipment, network, source, destination, launch_power, trx_type, bidir,
+                           margin, baudrate, rolloff, tx_osnr, min_osnr, spacing, min_freq, max_freq,
+                           roadm_osnr, pwr_start, pwr_stop, pwr_step, nodes_l=None, loose_l=None):
+    """Sweep the per-channel launch power (span input power) across [start, stop] dBm using GNPy's
+    native power-mode sweep, compute the mean GSNR at the destination for each power, and pick the
+    power that maximises GSNR. This is XLRON's launch-power optimisation done with GNPy.
+
+    The network is redesigned by GNPy at each swept power, so the GSNR-vs-power curve reflects a
+    realistic operating point for every candidate launch power.
+    """
+    try:
+        from copy import deepcopy as _deepcopy
+
+        if pwr_start is None or pwr_stop is None or pwr_step is None:
+            raise ValueError("Provide Start, Stop and Step values in 'Reference Power and Sweep'.")
+        p_start, p_stop, p_step = float(pwr_start), float(pwr_stop), float(pwr_step)
+        if p_step == 0:
+            raise ValueError("Sweep Step must be non-zero.")
+        p_step = abs(p_step)
+        if p_stop < p_start:
+            p_start, p_stop = p_stop, p_start
+        if p_stop - p_start < p_step / 2:
+            raise ValueError(
+                f"Sweep range is a single point ({p_start:.2f} dBm). Set a wider Start/Stop range "
+                "in the '⚡ Reference Power and Sweep' expander (e.g. Start -2, Stop 4, Step 0.5)."
+            )
+
+        if not equipment['Span']['default'].power_mode:
+            raise ValueError("Power sweep requires power mode (Span.power_mode = true); "
+                             "network is configured in gain mode.")
+
+        # Work on private copies so the cached network/equipment are not mutated by the redesign loop.
+        equipment = _deepcopy(equipment)
+        network = _deepcopy(network)
+
+        # Configure GNPy power sweep: design reference at p_start, deltas span up to (p_stop - p_start).
+        # NOTE: designed_network expects args_power in dBm (it converts to watt internally).
+        equipment['SI']['default'].power_range_db = [0.0, p_stop - p_start, p_step]
+
+        network, req, ref_req = designed_network(
+            equipment, network, source, destination,
+            nodes_list=nodes_l or [], loose_list=loose_l or [],
+            args_power=p_start, no_insert_edfas=False,
+        )
+
+        path, propagations, powers_dbm, infos = transmission_simulation(equipment, network, req, ref_req)
+
+        if not propagations:
+            raise ValueError("Power sweep produced no propagation results.")
+
+        def _mean_metric(trx, attr):
+            vals = getattr(trx, attr, None)
+            if vals is None:
+                return None
+            arr = np.asarray(vals, dtype=float)
+            arr = arr[np.isfinite(arr)]
+            return float(arr.mean()) if arr.size else None
+
+        powers = [round(float(p), 4) for p in powers_dbm]
+        gsnr_curve = [_mean_metric(prop[-1], 'snr') for prop in propagations]
+        gsnr01_curve = [_mean_metric(prop[-1], 'snr_01nm') for prop in propagations]
+
+        valid = [(p, g, g01) for p, g, g01 in zip(powers, gsnr_curve, gsnr01_curve) if g is not None]
+        if not valid:
+            raise ValueError("Could not compute GSNR for any swept power.")
+        opt_power, opt_gsnr, opt_gsnr01 = max(valid, key=lambda t: t[1])
+
+        path_elements = [getattr(e, "uid", str(e)) for e in path] if path is not None else []
+
+        st.session_state.power_opt = {
+            'powers_dbm': powers,
+            'gsnr_db': gsnr_curve,
+            'gsnr_01nm_db': gsnr01_curve,
+            'opt_power_dbm': opt_power,
+            'opt_gsnr_db': opt_gsnr,
+            'opt_gsnr_01nm_db': opt_gsnr01,
+            'n_points': len(powers),
+            'source': source,
+            'destination': destination,
+            'path_elements': path_elements,
+        }
+        st.session_state.power_opt_error = None
+    except Exception as e:
+        st.session_state.power_opt = None
+        st.session_state.power_opt_error = str(e)
 
 
 def run_simulation_callback(network, equipment, source, destination, launch_power, trx_type, bidir, margin, baudrate, rolloff, tx_osnr, min_osnr, spacing, min_freq, max_freq, roadm_osnr, pwr_start, pwr_stop, pwr_step, nodes_list, loose_list):
@@ -377,6 +542,187 @@ def run_simulation_callback(network, equipment, source, destination, launch_powe
         st.session_state.simulation_results = {'success': False}
         st.session_state.simulation_error = str(e)
 
+def _summary_band(values):
+    """Return (mean, min, max) of a per-channel metric list, ignoring non-finite entries."""
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None, None, None
+    return float(arr.mean()), float(arr.min()), float(arr.max())
+
+
+def render_along_path_plots(along_path):
+    """Render the per-link spectrum and GSNR-along-path Plotly charts from captured snapshots."""
+    snapshots = (along_path or {}).get('snapshots') or []
+    if not snapshots:
+        st.info("No along-path data captured. Run a transmission to populate per-link plots.")
+        return
+
+    def _node_label(snap):
+        clean = remove_type_from_nodeUid(snap['uid'])
+        return f"{snap['index']:02d} · {snap['type']} · {clean}"
+
+    x_km = [s['cumulative_km'] for s in snapshots]
+    labels = [_node_label(s) for s in snapshots]
+
+    gsnr_mean, gsnr_lo, gsnr_hi = zip(*[_summary_band(s['gsnr_db']) for s in snapshots])
+    osnr_mean = [_summary_band(s['osnr_ase_db'])[0] for s in snapshots]
+    nli_mean = [_summary_band(s['snr_nli_db'])[0] for s in snapshots]
+    pch_mean = [_summary_band(s['pch_dbm'])[0] for s in snapshots]
+
+    customdata = list(zip(labels, [s['type'] for s in snapshots]))
+
+    # ---- GSNR / OSNR / power along the path ----
+    st.markdown("**GSNR / OSNR along the path**")
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # min-max GSNR band across channels (only over points with a finite spread)
+    finite = [j for j in range(len(x_km)) if gsnr_lo[j] is not None and gsnr_hi[j] is not None]
+    if finite:
+        fx = [x_km[j] for j in finite]
+        band_x = fx + fx[::-1]
+        band_y = [gsnr_hi[j] for j in finite] + [gsnr_lo[j] for j in finite][::-1]
+        fig.add_trace(go.Scatter(
+            x=band_x, y=band_y, fill='toself', fillcolor='rgba(31,119,180,0.12)',
+            line=dict(width=0), hoverinfo='skip', showlegend=True, name='GSNR ch. spread'
+        ), secondary_y=False)
+
+    fig.add_trace(go.Scatter(
+        x=x_km, y=gsnr_mean, mode='lines+markers', name='GSNR (mean)',
+        line=dict(color='#1f77b4', width=3), customdata=customdata,
+        hovertemplate='%{customdata[0]}<br>%{x:.1f} km<br>GSNR: %{y:.2f} dB<extra></extra>'
+    ), secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=x_km, y=osnr_mean, mode='lines+markers', name='OSNR ASE (mean)',
+        line=dict(color='#2ca02c', width=2, dash='dash'), customdata=customdata,
+        hovertemplate='%{customdata[0]}<br>%{x:.1f} km<br>OSNR ASE: %{y:.2f} dB<extra></extra>'
+    ), secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=x_km, y=nli_mean, mode='lines+markers', name='SNR NLI (mean)',
+        line=dict(color='#9467bd', width=2, dash='dot'), customdata=customdata,
+        hovertemplate='%{customdata[0]}<br>%{x:.1f} km<br>SNR NLI: %{y:.2f} dB<extra></extra>'
+    ), secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=x_km, y=pch_mean, mode='lines+markers', name='Ch. power (mean)',
+        line=dict(color='#ff7f0e', width=2), customdata=customdata,
+        hovertemplate='%{customdata[0]}<br>%{x:.1f} km<br>Power: %{y:.2f} dBm<extra></extra>'
+    ), secondary_y=True)
+
+    fig.update_xaxes(title_text="Cumulative distance along path (km)")
+    fig.update_yaxes(title_text="SNR (dB)", secondary_y=False)
+    fig.update_yaxes(title_text="Channel power (dBm)", secondary_y=True)
+    fig.update_layout(
+        height=480, hovermode='x unified', margin=dict(t=30, b=0, l=0, r=0),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0)
+    )
+    st.plotly_chart(fig, use_container_width=True, key="along_path_gsnr")
+
+    # ---- Per-link spectrum at a selected element ----
+    st.markdown("**Per-link spectrum**")
+    sel_label = st.selectbox(
+        "Inspect spectrum at element:",
+        options=labels,
+        index=len(labels) - 1,
+        key="along_path_element_select",
+        help="Per-channel power and GSNR of the WDM comb at the output of the selected element."
+    )
+    snap = snapshots[labels.index(sel_label)]
+    freqs = snap['frequency_thz']
+
+    metric = st.radio(
+        "Spectrum metric",
+        options=["Channel power (dBm)", "GSNR (dB)", "OSNR ASE (dB)"],
+        horizontal=True,
+        key="along_path_spectrum_metric"
+    )
+    metric_map = {
+        "Channel power (dBm)": ('pch_dbm', '#ff7f0e', 'Power (dBm)'),
+        "GSNR (dB)": ('gsnr_db', '#1f77b4', 'GSNR (dB)'),
+        "OSNR ASE (dB)": ('osnr_ase_db', '#2ca02c', 'OSNR ASE (dB)'),
+    }
+    key_name, color, y_title = metric_map[metric]
+    y_vals = [v if np.isfinite(v) else None for v in snap[key_name]]
+
+    spec_fig = go.Figure()
+    spec_fig.add_trace(go.Bar(
+        x=freqs, y=y_vals, marker_color=color, name=y_title,
+        hovertemplate='%{x:.4f} THz<br>%{y:.2f}<extra></extra>'
+    ))
+    spec_fig.update_layout(
+        height=420,
+        xaxis_title="Frequency (THz)",
+        yaxis_title=y_title,
+        bargap=0.15,
+        margin=dict(t=40, b=0, l=0, r=0),
+        title=f"{snap['type']} · {remove_type_from_nodeUid(snap['uid'])}  ({snap['cumulative_km']:.1f} km)"
+    )
+    st.plotly_chart(spec_fig, use_container_width=True, key="along_path_spectrum")
+
+    mn, lo, hi = _summary_band(y_vals)
+    if mn is not None:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Channels", len([v for v in y_vals if v is not None]))
+        c2.metric(f"Mean", f"{mn:.2f}")
+        c3.metric("Min", f"{lo:.2f}")
+        c4.metric("Max", f"{hi:.2f}")
+
+
+def render_power_optimization(power_opt):
+    """Render the GSNR-vs-launch-power sweep curve with the optimum highlighted."""
+    powers = power_opt.get('powers_dbm') or []
+    gsnr = power_opt.get('gsnr_db') or []
+    gsnr01 = power_opt.get('gsnr_01nm_db') or []
+    if not powers:
+        st.info("No power sweep data. Run 'Optimize Launch Power' to populate the curve.")
+        return
+
+    opt_p = power_opt.get('opt_power_dbm')
+    opt_g = power_opt.get('opt_gsnr_db')
+    opt_g01 = power_opt.get('opt_gsnr_01nm_db')
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Optimum launch power", f"{opt_p:.2f} dBm" if opt_p is not None else "N/A")
+    c2.metric("GSNR @ optimum (signal bw)", f"{opt_g:.2f} dB" if opt_g is not None else "N/A")
+    c3.metric("GSNR @ optimum (0.1 nm)", f"{opt_g01:.2f} dB" if opt_g01 is not None else "N/A")
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=powers, y=gsnr, mode='lines+markers', name='GSNR (signal bw)',
+        line=dict(color='#1f77b4', width=3),
+        hovertemplate='Pch %{x:.2f} dBm<br>GSNR %{y:.2f} dB<extra></extra>'
+    ))
+    if any(v is not None for v in gsnr01):
+        fig.add_trace(go.Scatter(
+            x=powers, y=gsnr01, mode='lines+markers', name='GSNR (0.1 nm)',
+            line=dict(color='#2ca02c', width=2, dash='dash'),
+            hovertemplate='Pch %{x:.2f} dBm<br>GSNR %{y:.2f} dB<extra></extra>'
+        ))
+    if opt_p is not None and opt_g is not None:
+        fig.add_trace(go.Scatter(
+            x=[opt_p], y=[opt_g], mode='markers', name='Optimum',
+            marker=dict(color='#d62728', size=15, symbol='star'),
+            hovertemplate='Optimum<br>Pch %{x:.2f} dBm<br>GSNR %{y:.2f} dB<extra></extra>'
+        ))
+        fig.add_vline(x=opt_p, line=dict(color='#d62728', width=1, dash='dot'))
+    fig.update_layout(
+        height=460,
+        xaxis_title="Per-channel launch power (span input, dBm)",
+        yaxis_title="Mean GSNR over channels (dB)",
+        hovermode='x unified',
+        margin=dict(t=30, b=0, l=0, r=0),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0)
+    )
+    st.plotly_chart(fig, use_container_width=True, key="power_opt_curve")
+
+    table = pd.DataFrame({
+        'Launch power (dBm)': powers,
+        'GSNR signal bw (dB)': gsnr,
+        'GSNR 0.1nm (dB)': gsnr01,
+    })
+    with st.expander("View GSNR-vs-power table"):
+        st.dataframe(table, use_container_width=True, hide_index=True)
+
+
 def flatten_dict(d, parent_key='', sep='_'):
     """Flatten nested dictionary into single-level dict with compound keys"""
     items = []
@@ -463,7 +809,6 @@ def load_json_files(topo_path, eqpt_path, reqs_path):
     """Load network and equipment data"""
 
     return load_json_file(topo_path), load_json_file(eqpt_path), load_json_file(reqs_path)
-    
 
 
 def input_viewer(input_json, type_name: str):
@@ -569,8 +914,9 @@ def documentation_view():
         st.markdown("**Amplifier**")
         amplifier_df = pd.DataFrame(
             {
-                "Variable": ["gain_target", "tilt_target", "nf_min, nf_max", "p_max"],
+                "Variable": ["type_def","gain_target", "tilt_target", "nf_min, nf_max", "p_max"],
                 "Description": [
+                    "Noise models",
                     "Target gain (dB)",
                     "Gain tilt (dB)",
                     "Noise figure range (dB)",
@@ -640,27 +986,43 @@ def documentation_view():
 
 
 # Create tabs
-tab1, tab2, tab3 = st.tabs(["📄 Inputs", "📊 Network Visualization", "📘 Documentation"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📄 Inputs",
+    "🛠️ Custom Input Generator",
+    "📊 Network Visualization",
+    "📘 Documentation"
+])
 
 topology_json, equipment_json, requests_json = load_json_files(topology_path, equipment_path, requests_path)
 equipment, network = load_network_data(topology_path, equipment_path, requests_path)
 
                      
 
-# TAB 2: JSON Viewer
-with tab1:    
+# TAB 1: JSON Viewer
+with tab1:
     input_viewer(topology_json, "Topology")
     input_viewer(equipment_json, "Equipment")
     input_viewer(requests_json, "Requests")
 
-with tab3:
+with tab2:
+    # Set base directory for the custom input generator
+    set_base_dir(BASE_DIR)
+    
+    # Define callback to clear caches when custom inputs are applied
+    def _clear_caches():
+        load_json_files.clear()
+        load_network_data.clear()
+    
+    custom_input_generator_ui(topology_path, equipment_path, requests_path, on_apply_callback=_clear_caches)
+
+with tab4:
     documentation_view()
 
 network_df = pandas.json_normalize(topology_json.get("elements"))
 edges_df = pandas.json_normalize(topology_json.get("connections"))
 
-# TAB 1: Network Visualization
-with tab2:    
+# TAB 3: Network Visualization
+with tab3:
     if network is None:
         st.error("Network failed to load. Check the error message above.")
     else:
@@ -1146,6 +1508,13 @@ with tab2:
                         with st.expander("View all Per-Channel Parameters"):
                             st.dataframe(channel_df, use_container_width=True, hide_index=True)
 
+                    # Per-link spectrum / GSNR-along-path
+                    if st.session_state.get('along_path'):
+                        st.subheader("📡 Per-Link Spectrum & GSNR Along Path")
+                        render_along_path_plots(st.session_state.along_path)
+                    elif st.session_state.get('along_path_error'):
+                        st.warning(st.session_state.along_path_error)
+
 
                     # Display all results_2 parameters
                     st.subheader("📋 All Transmission Results Parameters")
@@ -1173,6 +1542,13 @@ with tab2:
             # Display errors if any
             if st.session_state.simulation_error is not None:
                 st.error(f"❌ Simulation failed: {st.session_state.simulation_error}")
+
+            # Launch-power optimization (GSNR-vs-power sweep)
+            if st.session_state.get('power_opt'):
+                st.subheader("⚡ Launch Power Optimization")
+                render_power_optimization(st.session_state.power_opt)
+            elif st.session_state.get('power_opt_error'):
+                st.error(f"❌ Power optimization failed: {st.session_state.power_opt_error}")
 
     with col2:
         st.subheader("Optical Path Simulation")
@@ -1282,11 +1658,11 @@ with tab2:
                 if 'sim_roadm_osnr' not in st.session_state:
                     st.session_state.sim_roadm_osnr = 33.0
                 if 'sim_pwr_start' not in st.session_state:
-                    st.session_state.sim_pwr_start = 2.0
+                    st.session_state.sim_pwr_start = -2.0
                 if 'sim_pwr_stop' not in st.session_state:
-                    st.session_state.sim_pwr_stop = None
+                    st.session_state.sim_pwr_stop = 4.0
                 if 'sim_pwr_step' not in st.session_state:
-                    st.session_state.sim_pwr_step = None
+                    st.session_state.sim_pwr_step = 0.5
                 
                 # Set Transceiver Parameters
                 with st.expander("Set Transceiver Parameters"):
@@ -1375,7 +1751,7 @@ with tab2:
                     with col_p2:
                         st.session_state.sim_pwr_stop = st.number_input(
                             "Stop [dBm]",
-                            value=float(st.session_state.sim_pwr_stop) if st.session_state.sim_pwr_stop is not None else 2.0,
+                            value=float(st.session_state.sim_pwr_stop) if st.session_state.sim_pwr_stop is not None else 4.0,
                             step=0.1,
                             key='pwr_stop'
                         )
@@ -1427,6 +1803,26 @@ with tab2:
                     on_click=run_transmission,
                     args=(
                         equipment, network, source, destination, launch_power, trx_type, bidir, st.session_state.sim_margin, st.session_state.sim_baudrate, st.session_state.sim_rolloff, st.session_state.sim_tx_osnr, st.session_state.sim_min_osnr, st.session_state.sim_spacing, st.session_state.sim_min_freq, st.session_state.sim_max_freq, st.session_state.sim_roadm_osnr, st.session_state.sim_pwr_start, st.session_state.sim_pwr_stop, st.session_state.sim_pwr_step
+                    )
+                ):
+                    pass  # Callback handles everything
+
+                st.caption(
+                    "Optimization sweeps span input power from Start to Stop (Step) in the "
+                    "'⚡ Reference Power and Sweep' expander and picks the GSNR-maximising power."
+                )
+                if st.button(
+                    "⚡ Optimize Launch Power",
+                    type="secondary",
+                    disabled=not can_run_simulation,
+                    on_click=run_power_optimization,
+                    args=(
+                        equipment, network, source, destination, launch_power, trx_type, bidir,
+                        st.session_state.sim_margin, st.session_state.sim_baudrate, st.session_state.sim_rolloff,
+                        st.session_state.sim_tx_osnr, st.session_state.sim_min_osnr, st.session_state.sim_spacing,
+                        st.session_state.sim_min_freq, st.session_state.sim_max_freq, st.session_state.sim_roadm_osnr,
+                        st.session_state.sim_pwr_start, st.session_state.sim_pwr_stop, st.session_state.sim_pwr_step,
+                        nodes_list, loose_list,
                     )
                 ):
                     pass  # Callback handles everything

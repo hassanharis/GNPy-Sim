@@ -1,0 +1,83 @@
+{
+  "TW TNDT": {
+    "uid": "TW TNDT",
+    "type_variety": "True wave",
+    "params": {
+      "ref_frequency": 193.4e12,
+      "length": 80,
+      "loss_coef": 0.2,
+      "length_units": "km",
+      "dispersion": 0.45e-05,
+      "dispersion_slope": 46,
+      "effective_area": 52e-12,
+      "n1": 1.468,
+      "n2": 2.6e-20,
+      "core_radius": 4.2e-06,
+      "att_in": 0,
+      "con_in": 0.0,
+      "con_out": 0.0,
+      "pmd_coef": 1.265e-15
+    },
+    "metadata": {
+      "location": {
+        "region": "",
+        "latitude": 1,
+        "longitude": 0
+      }
+    }
+  },
+  "TWC TNPS": {
+    "uid": "TWC TNPS",
+    "type_variety": "True wave",
+    "params": {
+      "ref_frequency": 193.4e12,
+      "length": 80,
+      "loss_coef": 0.23,
+      "length_units": "km",
+      "dispersion": 0.28e-05,
+      "dispersion_slope": 70,
+      "effective_area": 55e-12,
+      "n1": 1.468,
+      "n2": 2.7e-20,
+      "core_radius": 4.2e-06,
+      "att_in": 0,
+      "con_in": 0.0,
+      "con_out": 0.0,
+      "pmd_coef": 1.265e-15
+    },
+    "metadata": {
+      "location": {
+        "region": "",
+        "latitude": 1,
+        "longitude": 0
+      }
+    }
+  },
+  "TWRS TNPS": {
+    "uid": "TWRS TNPS",
+    "type_variety": "True wave",
+    "params": {
+      "ref_frequency": 193.4e12,
+      "length": 80,
+      "loss_coef": 0.23,
+      "length_units": "km",
+      "dispersion": 0.44e-05,
+      "dispersion_slope": 45,
+      "effective_area": 55e-12,
+      "n1": 1.468,
+      "n2": 2.7e-20,
+      "core_radius": 4.2e-06,
+      "att_in": 0,
+      "con_in": 0.0,
+      "con_out": 0.0,
+      "pmd_coef": 1.265e-15
+    },
+    "metadata": {
+      "location": {
+        "region": "",
+        "latitude": 1,
+        "longitude": 0
+      }
+    }
+  }
+}

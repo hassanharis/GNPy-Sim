@@ -1,0 +1,26 @@
+{
+  "L-Extended_C-Regular": {
+    "f_min": 185.525e12,
+    "f_max": 195.1e12
+  },
+  "L-Extended_C-Extended": {
+    "f_min": 185.525e12,
+    "f_max": 196.1e12
+  },
+  "L-Extended_C-Super": {
+    "f_min": 185.525e12,
+    "f_max": 196.725e12
+  },
+  "L-Super_C-Regular": {
+    "f_min": 184.825e12,
+    "f_max": 195.1e12
+  },
+  "L-Super_C-Extended": {
+    "f_min": 184.825e12,
+    "f_max": 196.1e12
+  },
+  "L-Super_C-Super": {
+    "f_min": 184.825e12,
+    "f_max": 196.725e12
+  }
+}

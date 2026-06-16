@@ -1,0 +1,12 @@
+{
+  "uid": "example_edfa",
+  "params": {
+    "type_variety": "std_fixed_gain",
+    "type_def": "fixed_gain",
+    "gain_flatmax": 21,
+    "gain_min": 20,
+    "p_max": 21,
+    "nf0": 6.0,
+    "allowed_for_design": false
+  }
+}

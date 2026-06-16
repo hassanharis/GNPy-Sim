@@ -1,0 +1,15 @@
+{
+  "name": "",
+  "population": 6,
+  "offspring": 2,
+  "max_num_generations": 5,
+  "crossover_eta": 15,
+  "crossover_prob": 0.9,
+  "mutation_eta": 30,
+  "mutation_prob": 0.9,
+  "seed": true,
+  "save_history": true,
+  "verbose": false,
+  "parallel": true,
+  "num_cores": 4
+}

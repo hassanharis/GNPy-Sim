@@ -1,0 +1,16 @@
+{
+  "raman_params": {
+    "flag": true,
+    "method":"perturbative",
+    "order": 2,
+    "result_spatial_resolution": 10e3,
+    "solver_spatial_resolution": 50
+  },
+  "nli_params": {
+    "method": "isrs_gn_model_analytic",
+    "dispersion_tolerance": 1,
+    "phase_shift_tolerance": 0.1,
+    "computed_channels": null,
+    "computed_number_of_channels": null
+  }
+}

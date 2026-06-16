@@ -1,0 +1,45 @@
+{
+  "uid": "OpenROADM 6.0 O6S",
+  "type_variety": "OpenROADM",
+  "tx_osnr": 38.0,
+  "tx_min_out_power": -1.0,
+  "tx_max_out_power": 20.0,
+  "mode": [
+    {
+      "format": "800E.131O6S",
+      "modulation": "16qam",
+      "baud_rate": 131.5e9,
+      "OSNR": 24.01,
+      "bit_rate": 800.0e9,
+      "roll_off": 0.10,
+      "min_spacing": 150.0e9,
+      "rx_min_power": -6.0,
+      "rx_max_power": 6.0,
+      "cost": 1.0
+    },
+    {
+      "format": "600E.118O6S",
+      "modulation": "16qam",
+      "baud_rate": 118.0e9,
+      "OSNR": 21.5,
+      "bit_rate": 600.0e9,
+      "roll_off": 0.10,
+      "min_spacing": 137.5e9,
+      "rx_min_power": -6.0,
+      "rx_max_power": 6.0,
+      "cost": 1.0
+    },
+    {
+      "format": "400E.118O6S",
+      "modulation": "qpsk",
+      "baud_rate": 118.0e9,
+      "OSNR": 17.11,
+      "bit_rate": 400.0e9,
+      "roll_off": 0.10,
+      "min_spacing": 137.5e9,
+      "rx_min_power": -6.0,
+      "rx_max_power": 6.0,
+      "cost": 1.0
+    }
+  ]
+}

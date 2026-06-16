@@ -1,0 +1,12 @@
+{
+  "uid": "S1_amp",
+  "params": {
+    "type_variety": "std_fixed_gain",
+    "type_def": "fixed_gain",
+    "gain_flatmax": 26,
+    "gain_min": 12,
+    "p_max": 24,
+    "nf0": 7.0,
+    "allowed_for_design": false
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "power_bands": {
+    "limits_band_power_dBm": [-10.0, 10.0],
+    "limits_band_tilt_dB_per_THz": [-2.0, 2.0]
+  },
+  "raman_amplification": false,
+  "raman_limits": null,
+  "optimization_option": "average_tilt"
+}

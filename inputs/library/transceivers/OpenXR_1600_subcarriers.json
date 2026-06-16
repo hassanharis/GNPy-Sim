@@ -1,0 +1,24 @@
+{
+  "uid": "OpenXR-1600",
+  "type_variety": "openXR",
+  "tx_osnr": 37.0,
+  "tx_min_out_power": -1.0,
+  "tx_max_out_power": 20.0,
+  "mode": [
+    {
+      "format": "16QAM-16000G",
+      "baud_rate": 240e9,
+      "OSNR": 30.0,
+      "bit_rate": 1600e9,
+      "roll_off": 0.1,
+      "min_spacing": 300.0e9,
+      "rx_min_power": -6.0,
+      "rx_max_power": 6.0,
+      "cost": 1.0,
+      "subcarriers": {
+        "number": 12,
+        "roll_off": 0.01
+      }
+    }
+  ]
+}

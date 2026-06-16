@@ -1,0 +1,33 @@
+{
+  "uid": "OpenROADM",
+  "type_variety": "OpenROADM",
+  "tx_osnr": 37.0,
+  "tx_min_out_power": -1.0,
+  "tx_max_out_power": 20.0,
+  "mode": [
+    {
+      "format": "16QAM-800G",
+      "modulation": "16qam",
+      "baud_rate": 126.0e9,
+      "OSNR": 27.0,
+      "bit_rate": 800.0e9,
+      "roll_off": 0.05,
+      "min_spacing": 150.0e9,
+      "rx_min_power": -6.0,
+      "rx_max_power": 6.0,
+      "cost": 1.0
+    },
+    {
+      "format": "QPSK-400G",
+      "modulation": "qpsk",
+      "baud_rate": 126.0e9,
+      "OSNR": 21.0,
+      "bit_rate": 800.0e9,
+      "roll_off": 0.05,
+      "min_spacing": 300.0e9,
+      "rx_min_power": -6.0,
+      "rx_max_power": 6.0,
+      "cost": 2.0
+    }
+  ]
+}

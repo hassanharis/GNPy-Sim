@@ -1,0 +1,15 @@
+{
+  "power_bands": {
+    "limits_band_power_dBm": [-10.0, 10.0],
+    "limits_band_tilt_dB_per_THz": [-2.0, 2.0]
+  },
+  "raman_amplification": true,
+  "raman_limits": {
+    "pump_limit": 20,
+    "pump_number": 20,
+    "min_pump_power_W": 0.05,
+    "max_pump_power_W": 1.0,
+    "limits_pump_power_W": [0.0, 1.0]
+  },
+  "optimization_option": "average_tilt"
+}

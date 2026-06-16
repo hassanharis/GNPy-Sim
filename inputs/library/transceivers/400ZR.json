@@ -1,0 +1,21 @@
+{
+  "uid": "400ZR",
+  "type_variety": "400ZR",
+  "tx_osnr": 37.0,
+  "tx_min_out_power": -1.0,
+  "tx_max_out_power": 20.0,
+  "mode": [
+    {
+      "format": "16QAM-400G",
+      "modulation": "16qam",
+      "baud_rate": 64.0e9,
+      "OSNR": 24.0,
+      "bit_rate": 400.0e9,
+      "roll_off": 0.1,
+      "min_spacing": 75.0e9,
+      "rx_min_power": -6.0,
+      "rx_max_power": 6.0,
+      "cost": 1.0
+    }
+  ]
+}

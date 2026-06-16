@@ -1,0 +1,57 @@
+{
+  "uid": "Proprietary PLT",
+  "type_variety": "Proprietary",
+  "tx_osnr": 38.0,
+  "tx_min_out_power": -1.0,
+  "tx_max_out_power": 20.0,
+  "mode": [
+    {
+      "format": "800E.135PLT",
+      "modulation": "16qam",
+      "baud_rate": 135.0e9,
+      "OSNR": 22.24,
+      "bit_rate": 800.0e9,
+      "roll_off": 0.10,
+      "min_spacing": 150.0e9,
+      "rx_min_power": -6.0,
+      "rx_max_power": 6.0,
+      "pdl_ref": {
+        "pdl": [1.0, 2.0, 4.0, 6.0],
+        "penalty": [0.15, 0.4, 1.5, 2.85]
+      },
+      "cost": 1.0
+    },
+    {
+      "format": "800E.143PLT",
+      "modulation": "16qam",
+      "baud_rate": 143.0e9,
+      "OSNR": 21.77,
+      "bit_rate": 800.0e9,
+      "roll_off": 0.10,
+      "min_spacing": 162.5e9,
+      "rx_min_power": -6.0,
+      "rx_max_power": 6.0,
+      "pdl_ref": {
+        "pdl": [1.0, 2.0, 4.0, 6.0],
+        "penalty": [0.15, 0.4, 1.5, 2.85]
+      },
+      "cost": 1.0
+    },
+    {
+      "format": "600E.135PLT",
+      "modulation": "16qam",
+      "baud_rate": 135.0e9,
+      "OSNR": 19.29,
+      "bit_rate": 600.0e9,
+      "roll_off": 0.10,
+      "min_spacing": 150.0e9,
+      "rx_min_power": -6.0,
+      "rx_max_power": 6.0,
+      "pdl_ref": {
+        "pdl": [1.0, 2.0, 4.0, 6.0],
+        "penalty": [0.15, 0.4, 1.5, 2.85]
+      },
+      "cost": 1.0
+    }
+  ]
+}
