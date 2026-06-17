@@ -42,6 +42,7 @@ from gnpy.topology.spectrum_assignment import (build_oms_list, build_path_oms_id
     aggregate_oms_bitmap, spectrum_selection, FIRST_FIT, LAST_FIT, BitmapValue)
 from gnpy.core import exceptions
 from gnpy.core.utils import watt2dbm, dbm2watt, automatic_nch
+from gnpy.core.equipment import trx_mode_params
 
 sys.path.append(r"C:\Users\hahassan\OneDrive - Nokia\Work & Data\Software\My Library")
 
@@ -277,22 +278,165 @@ def _normalized_route_constraints(destination, nodes_l, loose_l):
     return nl, ll
 
 
-def run_transmission(equipment, network, source, destination, launch_power, trx_type, bidir, margin, baudrate, rolloff, tx_osnr, spacing, min_freq, max_freq, pwr_start, pwr_stop, pwr_step, nodes_l=None, loose_l=None):
+AUTO_MODE_LABEL = "Auto (best feasible)"
+
+
+def transceiver_types(equipment):
+    """Sorted list of transceiver type_varieties available in the equipment library."""
+    return sorted((equipment or {}).get('Transceiver', {}).keys())
+
+
+def get_topology_transceiver_types(topology_json):
+    """Map each transceiver uid to its declared `type_variety` from the raw topology JSON.
+
+    GNPy drops the transceiver `type_variety` when it builds the network graph, so it is read
+    directly from the parsed topology file here. Transceivers without a declared type_variety
+    map to None (surfaced as 'not specified' in the UI).
+    """
+    mapping = {}
+    if isinstance(topology_json, dict):
+        for el in topology_json.get('elements', []) or []:
+            if isinstance(el, dict) and el.get('type') == 'Transceiver':
+                mapping[el.get('uid')] = el.get('type_variety')
+    return mapping
+
+
+def topology_transceiver_type(topology_json, uid):
+    """Return the declared `type_variety` for one transceiver uid (or None)."""
+    return get_topology_transceiver_types(topology_json).get(uid)
+
+
+def transceiver_modes(equipment, trx_type):
+    """List of mode 'format' names for a given transceiver type."""
+    trx = (equipment or {}).get('Transceiver', {}).get(trx_type)
+    if trx is None:
+        return []
+    return [m.get('format') for m in getattr(trx, 'mode', []) if m.get('format')]
+
+
+def transceiver_mode_dict(equipment, trx_type, fmt):
+    """Return the raw mode dict (baud_rate, OSNR, bit_rate, ...) for a type+format, or None."""
+    trx = (equipment or {}).get('Transceiver', {}).get(trx_type)
+    if trx is None:
+        return None
+    for m in getattr(trx, 'mode', []):
+        if m.get('format') == fmt:
+            return m
+    return None
+
+
+def _build_service_req(equipment, source, destination, trx_type, trx_mode, spacing_hz,
+                       launch_power_dbm, nodes_list, loose_list):
+    """Build a single-transmission PathRequest driven by a transceiver type + mode.
+
+    trx_mode=None means automatic mode selection (baud_rate/OSNR remain undetermined and are
+    resolved later by propagate_and_optimize_mode). The transceiver's own frequency band and the
+    mode's baud_rate/roll_off/tx_osnr/OSNR are used (NOT the generic SI default channel).
+    """
+    si = equipment['SI']['default']
+    trx_params = trx_mode_params(equipment, trx_type, trx_mode, error_message=True)
+    f_min = trx_params.get('f_min', si.f_min)
+    f_max = trx_params.get('f_max', si.f_max)
+    spacing = float(spacing_hz) if spacing_hz else trx_params.get('spacing') or si.spacing
+    # The slot must fit the mode: never let spacing drop below the mode's minimum spacing.
+    min_spacing = trx_params.get('min_spacing')
+    if min_spacing and spacing < min_spacing:
+        spacing = float(min_spacing)
+    power_w = dbm2watt(float(launch_power_dbm))
+    bit_rate = trx_params.get('bit_rate')
+    params = {
+        'request_id': 'transmission',
+        'source': source,
+        'destination': destination,
+        'bidir': False,
+        'trx_type': trx_type,
+        'trx_mode': trx_mode,
+        'format': trx_mode,
+        'spacing': spacing,
+        'power': power_w,
+        'tx_power': power_w,
+        'nb_channel': automatic_nch(f_min, f_max, spacing),
+        'f_min': f_min,
+        'f_max': f_max,
+        'baud_rate': trx_params.get('baud_rate'),
+        'bit_rate': bit_rate,
+        'roll_off': trx_params.get('roll_off'),
+        'OSNR': trx_params.get('OSNR'),
+        'penalties': trx_params.get('penalties'),
+        'tx_osnr': trx_params.get('tx_osnr'),
+        'min_spacing': trx_params.get('min_spacing'),
+        'cost': trx_params.get('cost'),
+        'path_bandwidth': bit_rate if bit_rate else 0,
+        'effective_freq_slot': None,
+        'equalization_offset_db': trx_params.get('equalization_offset_db', 0),
+        'nodes_list': list(nodes_list),
+        'loose_list': list(loose_list),
+    }
+    return PathRequest(**params)
+
+
+def _resolve_best_mode(equipment, network, service_req, launch_power_dbm):
+    """For automatic mode selection: design the network, route the request, and let GNPy pick the
+    highest-bit-rate feasible mode. Returns the chosen mode dict, or None if none is feasible.
+    `network` is mutated by the design step, so the caller must pass a private copy.
+    """
+    from copy import deepcopy as _deepcopy
+    designed_network(equipment, network, service_req.source, service_req.destination,
+                     nodes_list=service_req.nodes_list, loose_list=service_req.loose_list,
+                     args_power=launch_power_dbm, no_insert_edfas=False)
+    path = compute_constrained_path(network, service_req)
+    if not path:
+        return None
+    _path, mode = propagate_and_optimize_mode(_deepcopy(path), _deepcopy(service_req), equipment)
+    return mode
+
+
+def run_transmission(equipment, network, source, destination, launch_power, src_trx_type, src_trx_mode,
+                     dst_trx_type, dst_trx_mode, bidir, margin, spacing, pwr_start, pwr_stop, pwr_step,
+                     nodes_l=None, loose_l=None):
 
     try:
         from copy import deepcopy as _deepcopy
         # Private copies so the cached SI defaults / network are never mutated by a run.
         equipment = _deepcopy(equipment)
         network = _deepcopy(network)
-        _apply_si_overrides(equipment, baudrate=baudrate, rolloff=rolloff, tx_osnr=tx_osnr,
-                            spacing=spacing, min_freq=min_freq, max_freq=max_freq,
-                            margin=margin, power_dbm=launch_power)
+        # Only the system margin comes from SI here; the channel comes from the transceiver mode.
+        _apply_si_overrides(equipment, margin=margin)
         nl, ll = _normalized_route_constraints(destination, nodes_l, loose_l)
+
+        spacing_hz = float(spacing) * 1e9 if spacing else None
+        # The SOURCE transceiver type+mode defines the transmitted channel (drives propagation).
+        auto_mode = (src_trx_mode is None) or (str(src_trx_mode) == AUTO_MODE_LABEL)
+        service_req = _build_service_req(equipment, source, destination, src_trx_type,
+                                         None if auto_mode else src_trx_mode, spacing_hz,
+                                         launch_power, nl, ll)
+
+        if auto_mode:
+            mode = _resolve_best_mode(equipment, _deepcopy(network), service_req, launch_power)
+            if not mode:
+                raise ValueError(
+                    f"No feasible {src_trx_type} mode for this path (GSNR below required OSNR for all modes).")
+            service_req = _build_service_req(equipment, source, destination, src_trx_type,
+                                             mode['format'], spacing_hz, launch_power, nl, ll)
+
+        resolved_mode = service_req.tsp_mode
+        sys_margins = float(getattr(equipment['SI']['default'], 'sys_margins', 0.0) or 0.0)
+
+        # The DESTINATION transceiver mode defines the receiver feasibility threshold (required OSNR).
+        # If the destination mode is Auto, fall back to the transmitted mode's required OSNR.
+        dst_auto = (dst_trx_mode is None) or (str(dst_trx_mode) == AUTO_MODE_LABEL)
+        required_osnr = service_req.OSNR
+        if not dst_auto:
+            dmode = transceiver_mode_dict(equipment, dst_trx_type, dst_trx_mode)
+            if dmode is not None and dmode.get('OSNR') is not None:
+                required_osnr = dmode.get('OSNR')
+        resolved_dst_mode = service_req.tsp_mode if dst_auto else dst_trx_mode
 
         network, req, ref_req = designed_network(
             equipment, network, source, destination,
             nodes_list=nl, loose_list=ll,
             args_power=launch_power, no_insert_edfas=False,
+            service_req=service_req,
         )
 
         path, propagations, powers_dbm, infos = transmission_simulation(equipment, network, req, ref_req)
@@ -341,15 +485,36 @@ def run_transmission(equipment, network, source, destination, launch_power, trx_
             for element in path:
                 path_elements.append(getattr(element, "uid", str(element)))
 
+        # Feasibility verdict at the destination transceiver vs the mode's required OSNR + margin.
+        dest = path[-1] if path else None
+        gsnr_01nm = margin_db = verdict = None
+        if dest is not None and getattr(dest, 'snr_01nm', None) is not None:
+            snr01 = np.asarray(dest.snr_01nm, dtype=float)
+            pen = np.asarray(getattr(dest, 'total_penalty', 0.0), dtype=float)
+            gsnr_01nm = float(np.mean(snr01))
+            if required_osnr is not None:
+                margin_db = float(np.min(snr01 - pen)) - (float(required_osnr) + sys_margins)
+                verdict = 'PASS' if margin_db >= 0 else 'FAIL'
+
         st.session_state.highlighted_path = path_elements if path_elements else None
         st.session_state.simulation_results = {
             'success': True,
             'path_elements': path_elements,
             'path_length': len(path_elements),
             'osnr_ase': final_gsnr if final_gsnr is not None else "N/A",
-            'osnr_01nm': final_gsnr if final_gsnr is not None else "N/A",
+            'osnr_01nm': gsnr_01nm if gsnr_01nm is not None else "N/A",
             'propagations_count': len(propagations) if propagations is not None else 0,
-            'channel_count': len(powers_dbm) if powers_dbm is not None else 0
+            'channel_count': len(powers_dbm) if powers_dbm is not None else 0,
+            'trx_type': src_trx_type,
+            'trx_mode': resolved_mode,
+            'dst_trx_type': dst_trx_type,
+            'dst_trx_mode': resolved_dst_mode,
+            'required_osnr': required_osnr,
+            'sys_margins': sys_margins,
+            'gsnr_01nm': gsnr_01nm,
+            'margin_db': margin_db,
+            'verdict': verdict,
+            'bit_rate_gbps': round(float(service_req.bit_rate) * 1e-9, 1) if service_req.bit_rate else None,
         }
 
         st.session_state.transmission_results = {
@@ -405,15 +570,16 @@ def run_transmission(equipment, network, source, destination, launch_power, trx_
         st.session_state.simulation_error = str(e)
 
 
-def run_power_optimization(equipment, network, source, destination, launch_power, trx_type, bidir,
-                           margin, baudrate, rolloff, tx_osnr, spacing, min_freq, max_freq,
-                           pwr_start, pwr_stop, pwr_step, nodes_l=None, loose_l=None):
+def run_power_optimization(equipment, network, source, destination, launch_power, src_trx_type, src_trx_mode,
+                           dst_trx_type, dst_trx_mode, bidir,
+                           margin, spacing, pwr_start, pwr_stop, pwr_step, nodes_l=None, loose_l=None):
     """Sweep the per-channel launch power (span input power) across [start, stop] dBm using GNPy's
     native power-mode sweep, compute the mean GSNR at the destination for each power, and pick the
     power that maximises GSNR. This is XLRON's launch-power optimisation done with GNPy.
 
-    The network is redesigned by GNPy at each swept power, so the GSNR-vs-power curve reflects a
-    realistic operating point for every candidate launch power.
+    The transceiver type+mode define the propagated channel (auto mode is resolved first). The
+    network is redesigned by GNPy at each swept power, so the curve reflects a realistic operating
+    point for every candidate launch power.
     """
     try:
         from copy import deepcopy as _deepcopy
@@ -439,20 +605,30 @@ def run_power_optimization(equipment, network, source, destination, launch_power
         # Work on private copies so the cached network/equipment are not mutated by the redesign loop.
         equipment = _deepcopy(equipment)
         network = _deepcopy(network)
-
-        # Apply the configured transceiver/spectral settings to the swept reference channel.
-        _apply_si_overrides(equipment, baudrate=baudrate, rolloff=rolloff, tx_osnr=tx_osnr,
-                            spacing=spacing, min_freq=min_freq, max_freq=max_freq, margin=margin)
+        _apply_si_overrides(equipment, margin=margin)
         nl, ll = _normalized_route_constraints(destination, nodes_l, loose_l)
 
+        # Build the propagated channel from the SOURCE transceiver type+mode (resolve Auto first).
+        spacing_hz = float(spacing) * 1e9 if spacing else None
+        auto_mode = (src_trx_mode is None) or (str(src_trx_mode) == AUTO_MODE_LABEL)
+        service_req = _build_service_req(equipment, source, destination, src_trx_type,
+                                         None if auto_mode else src_trx_mode, spacing_hz, p_start, nl, ll)
+        if auto_mode:
+            mode = _resolve_best_mode(equipment, _deepcopy(network), service_req, p_start)
+            if not mode:
+                raise ValueError(
+                    f"No feasible {src_trx_type} mode for this path (GSNR below required OSNR for all modes).")
+            service_req = _build_service_req(equipment, source, destination, src_trx_type,
+                                             mode['format'], spacing_hz, p_start, nl, ll)
+
         # Configure GNPy power sweep: design reference at p_start, deltas span up to (p_stop - p_start).
-        # NOTE: designed_network expects args_power in dBm (it converts to watt internally).
         equipment['SI']['default'].power_range_db = [0.0, p_stop - p_start, p_step]
 
         network, req, ref_req = designed_network(
             equipment, network, source, destination,
             nodes_list=nl, loose_list=ll,
             args_power=p_start, no_insert_edfas=False,
+            service_req=service_req,
         )
 
         path, propagations, powers_dbm, infos = transmission_simulation(equipment, network, req, ref_req)
@@ -1044,15 +1220,13 @@ def render_power_optimization(power_opt):
         st.dataframe(table, use_container_width=True, hide_index=True)
 
 
-def render_sim_inputs_preview(source, destination, nodes_list, loose_list, launch_power, trx_type, bidir):
-    """Summarize the inputs configured for the single-path simulation (shown once a source and
-    destination are selected, before the run). This reflects the values the run will be launched
-    with so the user can review them up front."""
+def render_sim_inputs_preview(equipment, source, destination, nodes_list, loose_list, launch_power,
+                              src_trx_type, src_trx_mode, dst_trx_type, dst_trx_mode, bidir):
+    """Show the inputs the single-path run will actually use, split into Transmit (source) and
+    Receive (destination) groups. The transmit channel comes from the source transceiver mode; the
+    receive feasibility threshold (required OSNR) comes from the destination transceiver mode.
+    Auto = best feasible, resolved at run time."""
     ss = st.session_state
-    constraints = ", ".join(
-        f"{remove_type_from_nodeUid(str(n))} [{lt}]"
-        for n, lt in zip(nodes_list or [], loose_list or [])
-    ) or "—"
 
     def _f(key, default=0.0):
         v = ss.get(key, default)
@@ -1062,35 +1236,69 @@ def render_sim_inputs_preview(source, destination, nodes_list, loose_list, launc
             return None
 
     spacing_ghz = _f('sim_spacing')
-    fmin_thz = _f('sim_min_freq')
-    fmax_thz = _f('sim_max_freq')
-    try:
-        nch = automatic_nch(fmin_thz * 1e12, fmax_thz * 1e12, spacing_ghz * 1e9)
-    except Exception:
-        nch = None
+    constraints = ", ".join(
+        f"{remove_type_from_nodeUid(str(n))} [{lt}]"
+        for n, lt in zip(nodes_list or [], loose_list or [])
+    ) or "—"
 
-    rows = [
-        ("Path", "Source", remove_type_from_nodeUid(str(source))),
-        ("Path", "Destination", remove_type_from_nodeUid(str(destination))),
-        ("Path", "Include-node constraints", constraints),
-        ("Transceiver", "Type", str(trx_type)),
-        ("Transceiver", "Bidirectional", "Yes" if bidir else "No"),
-        ("Transceiver", "Launch power", f"{float(launch_power):.1f} dBm"),
-        ("Transceiver", "Baud rate", f"{_f('sim_baudrate'):.2f} GBaud"),
-        ("Transceiver", "Roll-off", f"{_f('sim_rolloff'):.2f}"),
-        ("Transceiver", "Tx OSNR", f"{_f('sim_tx_osnr'):.1f} dB"),
-        ("Transceiver", "System margin", f"{_f('sim_margin'):.1f} dB"),
-        ("Spectral load", "Channel spacing", f"{spacing_ghz:.2f} GHz"),
-        ("Spectral load", "Frequency range", f"{fmin_thz:.2f} – {fmax_thz:.2f} THz"),
-        ("Spectral load", "Channels (auto)", str(nch) if nch is not None else "—"),
+    src_auto = src_trx_mode is None
+    src_mode = None if src_auto else transceiver_mode_dict(equipment, src_trx_type, src_trx_mode)
+    src_trx = (equipment or {}).get('Transceiver', {}).get(src_trx_type)
+    freq = getattr(src_trx, 'frequency', None) if src_trx is not None else None
+
+    def _ghz(v):
+        return f"{v * 1e-9:.2f}" if v is not None else "—"
+
+    # ---- Transmit (source) ----
+    st.markdown("**Transmit — source**")
+    tx_rows = [
+        ("Source", remove_type_from_nodeUid(str(source))),
+        ("Include-node constraints", constraints),
+        ("Transceiver type", str(src_trx_type)),
+        ("Mode", AUTO_MODE_LABEL if src_auto else str(src_trx_mode)),
+        ("Launch power", f"{float(launch_power):.1f} dBm"),
+        ("Bidirectional", "Yes" if bidir else "No"),
+        ("Channel spacing", f"{spacing_ghz:.2f} GHz"),
     ]
+    if src_mode is not None:
+        tx_rows += [
+            ("Baud rate", f"{src_mode.get('baud_rate', 0) * 1e-9:.2f} GBaud"),
+            ("Roll-off", f"{src_mode.get('roll_off', '—')}"),
+            ("Tx OSNR", f"{src_mode.get('tx_osnr', '—')} dB"),
+            ("Bit rate", f"{src_mode.get('bit_rate', 0) * 1e-9:.0f} Gb/s"),
+        ]
+    else:
+        tx_rows.append(("Baud rate / roll-off / Tx OSNR", "resolved at run (best feasible mode)"))
+    if freq:
+        tx_rows.append(("Frequency band", f"{_ghz(freq.get('min')) }– {_ghz(freq.get('max'))} (×1e3 GHz)"))
+    st.dataframe(pd.DataFrame(tx_rows, columns=["Parameter", "Value"]),
+                 use_container_width=True, hide_index=True)
+
+    # ---- Receive (destination) ----
+    dst_auto = dst_trx_mode is None
+    dst_mode = None if dst_auto else transceiver_mode_dict(equipment, dst_trx_type, dst_trx_mode)
+    st.markdown("**Receive — destination**")
+    rx_rows = [
+        ("Destination", remove_type_from_nodeUid(str(destination))),
+        ("Transceiver type", str(dst_trx_type)),
+        ("Mode", AUTO_MODE_LABEL if dst_auto else str(dst_trx_mode)),
+        ("System margin", f"{_f('sim_margin'):.1f} dB"),
+    ]
+    if dst_mode is not None:
+        req_osnr = dst_mode.get('OSNR')
+        rx_rows += [
+            ("Required OSNR (FEC threshold)", f"{req_osnr} dB" if req_osnr is not None else "—"),
+            ("Min spacing", f"{dst_mode.get('min_spacing', 0) * 1e-9:.1f} GHz" if dst_mode.get('min_spacing') else "—"),
+            ("Pass criterion", f"GSNR(0.1nm) ≥ {req_osnr} + {_f('sim_margin'):.1f} dB" if req_osnr is not None else "—"),
+        ]
+    else:
+        rx_rows.append(("Required OSNR", "from the transmitted mode (destination set to Auto)"))
+    st.dataframe(pd.DataFrame(rx_rows, columns=["Parameter", "Value"]),
+                 use_container_width=True, hide_index=True)
+
     p_start, p_stop, p_step = _f('sim_pwr_start'), _f('sim_pwr_stop'), _f('sim_pwr_step')
     if p_start is not None and p_stop is not None and p_step:
-        rows.append(("Power sweep", "Range (optimization)",
-                     f"{p_start:.1f} → {p_stop:.1f} dBm, step {p_step:.2f}"))
-
-    st.dataframe(pd.DataFrame(rows, columns=["Group", "Parameter", "Value"]),
-                 use_container_width=True, hide_index=True)
+        st.caption(f"Power sweep (optimization): {p_start:.1f} → {p_stop:.1f} dBm, step {p_step:.2f}")
 
 
 def render_batch_rsa(result):
@@ -1904,17 +2112,32 @@ with tab3:
                     # Results
                     st.subheader("📊 Results")
                     
+                    tx_label = f"{results.get('trx_type', '')} · {results.get('trx_mode') or 'auto'}".strip(' ·')
+                    rx_label = f"{results.get('dst_trx_type', '')} · {results.get('dst_trx_mode') or 'auto'}".strip(' ·')
+                    if tx_label or rx_label:
+                        st.caption(f"TX (source): {tx_label}  →  RX (destination): {rx_label}"
+                                   + (f"  ·  bit rate {results['bit_rate_gbps']:.0f} Gb/s"
+                                      if results.get('bit_rate_gbps') else ""))
+
                     col_1, col_2, col_3, col_4 = st.columns(4)
                     with col_1:
-                        osnr_val = results['osnr_ase']
-                        st.metric("Avg OSNR (ASE)", f"{osnr_val:.2f} dB" if isinstance(osnr_val, (int, float)) else osnr_val)
+                        gsnr01 = results.get('gsnr_01nm')
+                        st.metric("GSNR @ 0.1nm", f"{gsnr01:.2f} dB" if isinstance(gsnr01, (int, float)) else "N/A")
                     with col_2:
-                        osnr_01nm = results['osnr_01nm']
-                        st.metric("Avg OSNR @ 0.1nm", f"{osnr_01nm:.2f} dB" if isinstance(osnr_01nm, (int, float)) else osnr_01nm)
+                        req = results.get('required_osnr')
+                        st.metric("Required OSNR", f"{req:.2f} dB" if isinstance(req, (int, float)) else "N/A")
                     with col_3:
-                        st.metric("Path Found", "Yes")
+                        mar = results.get('margin_db')
+                        verdict = results.get('verdict')
+                        st.metric("Margin", f"{mar:+.2f} dB" if isinstance(mar, (int, float)) else "N/A",
+                                  delta=verdict if verdict else None)
                     with col_4:
                         st.metric("Number of Hops", results['path_length'])
+
+                    if results.get('verdict') == 'PASS':
+                        st.success(f"✅ Feasible — GSNR margin {results['margin_db']:+.2f} dB above required OSNR + system margin.")
+                    elif results.get('verdict') == 'FAIL':
+                        st.error(f"❌ Infeasible — GSNR margin {results['margin_db']:+.2f} dB (below required OSNR + system margin).")
                     
                     #propagations_count = results['propagations_count']
                     #st.metric("Number of Propagations", f"{propagations_count}" if isinstance(propagations_count, (int, float)) else propagations_count)
@@ -2072,13 +2295,64 @@ with tab3:
 
                     # Basic simulation settings
                     st.subheader("Simulation Configuration")
-                    col_a, col_b, col_c = st.columns(3)
 
-                    with col_a:
-                        launch_power = st.slider("Launch Power (dBm)", -5, 5, 0)
-                    with col_b:
-                        trx_type = st.text_input("Transceiver Type", "Voyager")
+                    trx_opts = transceiver_types(equipment)
+
+                    # Transceiver type_variety declared in the topology for each endpoint.
+                    topo_trx = get_topology_transceiver_types(topology_json)
+                    src_variety = topo_trx.get(source)
+                    dst_variety = topo_trx.get(destination)
+
+                    def _endpoint_selectors(role, uid, variety, prefix):
+                        """Render type(override)+mode selectors for one endpoint, auto-populating the type
+                        from the node's topology type_variety. Returns (trx_type, trx_mode|None=Auto)."""
+                        if not uid:
+                            st.markdown(f"**{role}** — _select a node_")
+                            return None, None
+                        name = remove_type_from_nodeUid(str(uid))
+                        if variety:
+                            tag = f"`{variety}`" + ("" if variety in trx_opts else " ⚠️ not in equipment library")
+                        else:
+                            tag = "_not specified in topology_"
+                        st.markdown(f"**{role}** — {name}: {tag}")
+
+                        if not trx_opts:
+                            st.warning("No transceivers found in the equipment library.")
+                            return None, None
+
+                        type_key, mode_key = f'{prefix}_trx_type_select', f'{prefix}_trx_mode_select'
+                        autopop_key = f'_{prefix}_autopop'
+                        fallback_type = 'Voyager' if 'Voyager' in trx_opts else trx_opts[0]
+                        # Auto-populate the type from the node's topology type_variety when the node changes.
+                        if st.session_state.get(autopop_key) != uid:
+                            st.session_state[autopop_key] = uid
+                            if variety and variety in trx_opts:
+                                st.session_state[type_key] = variety
+                        if st.session_state.get(type_key) not in trx_opts:
+                            st.session_state[type_key] = fallback_type
+
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            t = st.selectbox(f"{role} type (override)", options=trx_opts, key=type_key,
+                                             help="Defaults to the node's topology type_variety; "
+                                                  "change it to test a different transceiver.")
+                        with c2:
+                            m_opts = [AUTO_MODE_LABEL] + transceiver_modes(equipment, t)
+                            if st.session_state.get(mode_key) not in m_opts:
+                                st.session_state[mode_key] = AUTO_MODE_LABEL
+                            m_label = st.selectbox(f"{role} mode", options=m_opts, key=mode_key,
+                                                   help="'Auto' picks the best feasible mode.")
+                        return t, (None if m_label == AUTO_MODE_LABEL else m_label)
+
+                    src_trx_type, src_trx_mode = _endpoint_selectors("Source trx", source, src_variety, 'src')
+                    dst_trx_type, dst_trx_mode = _endpoint_selectors("Destination trx", destination, dst_variety, 'dst')
+                    st.caption("The source type+mode defines the transmitted channel (drives propagation); "
+                               "the destination mode sets the required-OSNR threshold for the feasibility verdict.")
+
+                    col_c, col_d = st.columns(2)
                     with col_c:
+                        launch_power = st.slider("Launch Power (dBm)", -5, 5, 0)
+                    with col_d:
                         bidir = st.checkbox("Bidirectional", value=False)
 
                     si = equipment['SI']['default']
@@ -2091,22 +2365,12 @@ with tab3:
                         except (TypeError, ValueError):
                             return fallback
 
-                    # Seed simulation parameters from the equipment SI reference channel (defaults).
-                    # These are display-unit copies; editing them never changes the SI library.
+                    # Only spacing, system margin and the sweep are user inputs; the rest of the channel
+                    # (baud rate, roll-off, Tx OSNR, required OSNR, band) comes from the transceiver mode.
                     if 'sim_margin' not in st.session_state:
                         st.session_state.sim_margin = _si_default('sys_margins', 0.0)
-                    if 'sim_baudrate' not in st.session_state:
-                        st.session_state.sim_baudrate = _si_default('baud_rate', 31.57, 1e-9)
-                    if 'sim_rolloff' not in st.session_state:
-                        st.session_state.sim_rolloff = _si_default('roll_off', 0.15)
-                    if 'sim_tx_osnr' not in st.session_state:
-                        st.session_state.sim_tx_osnr = _si_default('tx_osnr', 40.0)
                     if 'sim_spacing' not in st.session_state:
                         st.session_state.sim_spacing = _si_default('spacing', 50.0, 1e-9)
-                    if 'sim_min_freq' not in st.session_state:
-                        st.session_state.sim_min_freq = _si_default('f_min', 191.30, 1e-12)
-                    if 'sim_max_freq' not in st.session_state:
-                        st.session_state.sim_max_freq = _si_default('f_max', 196.10, 1e-12)
                     if 'sim_pwr_start' not in st.session_state:
                         st.session_state.sim_pwr_start = -2.0
                     if 'sim_pwr_stop' not in st.session_state:
@@ -2114,64 +2378,26 @@ with tab3:
                     if 'sim_pwr_step' not in st.session_state:
                         st.session_state.sim_pwr_step = 0.5
 
-                    # Set Transceiver Parameters
-                    with st.expander("Set Transceiver Parameters"):
-                        col_t1, col_t2 = st.columns(2)
-                        with col_t1:
+                    # Channel & System Parameters (the only directly editable physical inputs)
+                    with st.expander("📡 Channel & System Parameters"):
+                        col_s1, col_s2 = st.columns(2)
+                        with col_s1:
+                            st.session_state.sim_spacing = st.number_input(
+                                "Channel spacing [GHz]",
+                                value=float(st.session_state.sim_spacing),
+                                step=0.01,
+                                key='spec_spacing',
+                                help="Should be ≥ the selected mode's minimum spacing."
+                            )
+                        with col_s2:
                             st.session_state.sim_margin = st.number_input(
-                                "Margin [dB]",
+                                "System margin [dB]",
                                 value=float(st.session_state.sim_margin),
                                 step=0.1,
                                 key='trx_margin'
                             )
-                            st.session_state.sim_baudrate = st.number_input(
-                                "Baudrate [Gbaud]",
-                                value=float(st.session_state.sim_baudrate),
-                                step=0.01,
-                                key='trx_baudrate'
-                            )
-                            st.session_state.sim_rolloff = st.number_input(
-                                "Roll-off",
-                                value=float(st.session_state.sim_rolloff),
-                                min_value=0.0,
-                                max_value=1.0,
-                                step=0.01,
-                                key='trx_rolloff'
-                            )
-                        with col_t2:
-                            st.session_state.sim_tx_osnr = st.number_input(
-                                "Tx OSNR [dB]",
-                                value=float(st.session_state.sim_tx_osnr),
-                                step=0.1,
-                                key='trx_tx_osnr'
-                            )
-
-                    # Spectral Load Parameters
-                    with st.expander("📡 Spectral Load Parameters"):
-                        col_s1, col_s2, col_s3 = st.columns(3)
-                        with col_s1:
-                            st.session_state.sim_spacing = st.number_input(
-                                "Spacing [GHz]",
-                                value=float(st.session_state.sim_spacing),
-                                step=0.01,
-                                key='spec_spacing'
-                            )
-                        with col_s2:
-                            st.session_state.sim_min_freq = st.number_input(
-                                "Minimum Frequency [THz]",
-                                value=float(st.session_state.sim_min_freq),
-                                step=0.01,
-                                format="%.2f",
-                                key='spec_min_freq'
-                            )
-                        with col_s3:
-                            st.session_state.sim_max_freq = st.number_input(
-                                "Maximum Frequency [THz]",
-                                value=float(st.session_state.sim_max_freq),
-                                step=0.01,
-                                format="%.2f",
-                                key='spec_max_freq'
-                            )
+                        st.caption("Baud rate, roll-off, Tx OSNR, required OSNR and the frequency band are "
+                                   "taken from the selected transceiver mode.")
 
                     # Reference Power and Sweep
                     with st.expander("⚡ Reference Power and Sweep"):
@@ -2202,11 +2428,12 @@ with tab3:
 
                     if can_run_simulation:
                         st.subheader("🧾 Simulation inputs to be used")
-                        render_sim_inputs_preview(source, destination, nodes_list, loose_list,
-                                                  launch_power, trx_type, bidir)
+                        render_sim_inputs_preview(equipment, source, destination, nodes_list, loose_list,
+                                                  launch_power, src_trx_type, src_trx_mode,
+                                                  dst_trx_type, dst_trx_mode, bidir)
                         st.caption(
-                            "These values are applied to the propagated reference channel — editing them "
-                            "changes the simulation. The equipment SI library defaults are left unchanged."
+                            "The transmit channel comes from the selected transceiver mode; the receive side "
+                            "shows the feasibility threshold. The equipment SI library defaults are unchanged."
                         )
 
                     if st.button(
@@ -2215,7 +2442,11 @@ with tab3:
                         disabled=not can_run_simulation,
                         on_click=run_transmission,
                         args=(
-                            equipment, network, source, destination, launch_power, trx_type, bidir, st.session_state.sim_margin, st.session_state.sim_baudrate, st.session_state.sim_rolloff, st.session_state.sim_tx_osnr, st.session_state.sim_spacing, st.session_state.sim_min_freq, st.session_state.sim_max_freq, st.session_state.sim_pwr_start, st.session_state.sim_pwr_stop, st.session_state.sim_pwr_step, nodes_list, loose_list
+                            equipment, network, source, destination, launch_power,
+                            src_trx_type, src_trx_mode, dst_trx_type, dst_trx_mode, bidir,
+                            st.session_state.sim_margin, st.session_state.sim_spacing,
+                            st.session_state.sim_pwr_start, st.session_state.sim_pwr_stop, st.session_state.sim_pwr_step,
+                            nodes_list, loose_list,
                         )
                     ):
                         pass  # Callback handles everything
@@ -2230,10 +2461,9 @@ with tab3:
                         disabled=not can_run_simulation,
                         on_click=run_power_optimization,
                         args=(
-                            equipment, network, source, destination, launch_power, trx_type, bidir,
-                            st.session_state.sim_margin, st.session_state.sim_baudrate, st.session_state.sim_rolloff,
-                            st.session_state.sim_tx_osnr, st.session_state.sim_spacing,
-                            st.session_state.sim_min_freq, st.session_state.sim_max_freq,
+                            equipment, network, source, destination, launch_power,
+                            src_trx_type, src_trx_mode, dst_trx_type, dst_trx_mode, bidir,
+                            st.session_state.sim_margin, st.session_state.sim_spacing,
                             st.session_state.sim_pwr_start, st.session_state.sim_pwr_stop, st.session_state.sim_pwr_step,
                             nodes_list, loose_list,
                         )
