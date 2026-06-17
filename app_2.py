@@ -5,8 +5,9 @@ Streamlit application for optical network simulation
 
 import json
 from copy import deepcopy
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, List
 import pandas
 import streamlit as st
 import plotly.graph_objects as go
@@ -32,11 +33,15 @@ from gnpy.tools.json_io import (load_equipment,
     load_requests,
     save_network,
     save_json,
+    requests_from_json,
 )
 from gnpy.tools.worker_utils import designed_network, transmission_simulation, planning
-from gnpy.topology.request import PathRequest, ResultElement, compute_path_dsjctn,compute_constrained_path
+from gnpy.topology.request import (PathRequest, ResultElement, compute_path_dsjctn, compute_constrained_path,
+    propagate, propagate_and_optimize_mode, compute_spectrum_slot_vs_bandwidth, correct_json_route_list)
+from gnpy.topology.spectrum_assignment import (build_oms_list, build_path_oms_id_list,
+    aggregate_oms_bitmap, spectrum_selection, FIRST_FIT, LAST_FIT, BitmapValue)
 from gnpy.core import exceptions
-from gnpy.core.utils import watt2dbm, dbm2watt
+from gnpy.core.utils import watt2dbm, dbm2watt, automatic_nch
 
 sys.path.append(r"C:\Users\hahassan\OneDrive - Nokia\Work & Data\Software\My Library")
 
@@ -103,6 +108,10 @@ if 'power_opt' not in st.session_state:
     st.session_state.power_opt = None
 if 'power_opt_error' not in st.session_state:
     st.session_state.power_opt_error = None
+if 'batch_rsa' not in st.session_state:
+    st.session_state.batch_rsa = None
+if 'batch_rsa_error' not in st.session_state:
+    st.session_state.batch_rsa_error = None
 if 'simulation_error' not in st.session_state:
     st.session_state.simulation_error = None
    
@@ -229,13 +238,61 @@ def compute_along_path_snapshots(equipment, network, req):
     }
 
 
-def run_transmission(equipment, network, source, destination, launch_power, trx_type, bidir, margin, baudrate, rolloff, tx_osnr, min_osnr, spacing, min_freq, max_freq, roadm_osnr, pwr_start, pwr_stop, pwr_step, nodes_l=None, loose_l=None):
+def _apply_si_overrides(equipment, baudrate=None, rolloff=None, tx_osnr=None,
+                        spacing=None, min_freq=None, max_freq=None, margin=None, power_dbm=None):
+    """Override the SI reference channel on a (private, already deep-copied) equipment dict from
+    the UI values so the propagation actually uses the configured transceiver/spectral settings.
+
+    Display units: baudrate [GBaud], spacing [GHz], min/max freq [THz], tx_osnr/margin [dB],
+    power_dbm [dBm]. The caller MUST pass a deep copy so the cached SI defaults stay untouched.
+    """
+    si = equipment['SI']['default']
+
+    def _set(attr, value, scale=1.0):
+        if value is None:
+            return
+        try:
+            setattr(si, attr, float(value) * scale)
+        except (TypeError, ValueError):
+            pass
+
+    _set('baud_rate', baudrate, 1e9)
+    _set('roll_off', rolloff)
+    _set('tx_osnr', tx_osnr)
+    _set('spacing', spacing, 1e9)
+    _set('f_min', min_freq, 1e12)
+    _set('f_max', max_freq, 1e12)
+    _set('sys_margins', margin)
+    _set('power_dbm', power_dbm)
+    return equipment
+
+
+def _normalized_route_constraints(destination, nodes_l, loose_l):
+    """Ensure the include-node list ends with the destination, as compute_constrained_path requires."""
+    nl = [n for n in (nodes_l or []) if n]
+    ll = list(loose_l or [])[:len(nl)]
+    if destination and (not nl or nl[-1] != destination):
+        nl = nl + [destination]
+        ll = ll + ['STRICT']
+    return nl, ll
+
+
+def run_transmission(equipment, network, source, destination, launch_power, trx_type, bidir, margin, baudrate, rolloff, tx_osnr, spacing, min_freq, max_freq, pwr_start, pwr_stop, pwr_step, nodes_l=None, loose_l=None):
 
     try:
+        from copy import deepcopy as _deepcopy
+        # Private copies so the cached SI defaults / network are never mutated by a run.
+        equipment = _deepcopy(equipment)
+        network = _deepcopy(network)
+        _apply_si_overrides(equipment, baudrate=baudrate, rolloff=rolloff, tx_osnr=tx_osnr,
+                            spacing=spacing, min_freq=min_freq, max_freq=max_freq,
+                            margin=margin, power_dbm=launch_power)
+        nl, ll = _normalized_route_constraints(destination, nodes_l, loose_l)
+
         network, req, ref_req = designed_network(
             equipment, network, source, destination,
-            nodes_list=[], loose_list=[],
-            args_power=dbm2watt(launch_power), no_insert_edfas=False,
+            nodes_list=nl, loose_list=ll,
+            args_power=launch_power, no_insert_edfas=False,
         )
 
         path, propagations, powers_dbm, infos = transmission_simulation(equipment, network, req, ref_req)
@@ -349,8 +406,8 @@ def run_transmission(equipment, network, source, destination, launch_power, trx_
 
 
 def run_power_optimization(equipment, network, source, destination, launch_power, trx_type, bidir,
-                           margin, baudrate, rolloff, tx_osnr, min_osnr, spacing, min_freq, max_freq,
-                           roadm_osnr, pwr_start, pwr_stop, pwr_step, nodes_l=None, loose_l=None):
+                           margin, baudrate, rolloff, tx_osnr, spacing, min_freq, max_freq,
+                           pwr_start, pwr_stop, pwr_step, nodes_l=None, loose_l=None):
     """Sweep the per-channel launch power (span input power) across [start, stop] dBm using GNPy's
     native power-mode sweep, compute the mean GSNR at the destination for each power, and pick the
     power that maximises GSNR. This is XLRON's launch-power optimisation done with GNPy.
@@ -383,13 +440,18 @@ def run_power_optimization(equipment, network, source, destination, launch_power
         equipment = _deepcopy(equipment)
         network = _deepcopy(network)
 
+        # Apply the configured transceiver/spectral settings to the swept reference channel.
+        _apply_si_overrides(equipment, baudrate=baudrate, rolloff=rolloff, tx_osnr=tx_osnr,
+                            spacing=spacing, min_freq=min_freq, max_freq=max_freq, margin=margin)
+        nl, ll = _normalized_route_constraints(destination, nodes_l, loose_l)
+
         # Configure GNPy power sweep: design reference at p_start, deltas span up to (p_stop - p_start).
         # NOTE: designed_network expects args_power in dBm (it converts to watt internally).
         equipment['SI']['default'].power_range_db = [0.0, p_stop - p_start, p_step]
 
         network, req, ref_req = designed_network(
             equipment, network, source, destination,
-            nodes_list=nodes_l or [], loose_list=loose_l or [],
+            nodes_list=nl, loose_list=ll,
             args_power=p_start, no_insert_edfas=False,
         )
 
@@ -435,112 +497,371 @@ def run_power_optimization(equipment, network, source, destination, launch_power
         st.session_state.power_opt_error = str(e)
 
 
-def run_simulation_callback(network, equipment, source, destination, launch_power, trx_type, bidir, margin, baudrate, rolloff, tx_osnr, min_osnr, spacing, min_freq, max_freq, roadm_osnr, pwr_start, pwr_stop, pwr_step, nodes_list, loose_list):
-    """Callback function to run simulation and store results in session state"""
+# ---------------------------------------------------------------------------
+# Batch RSA pipeline
+# ---------------------------------------------------------------------------
+# The engine is decomposed into independent stages, each with an explicit
+# input/output contract (the dataclasses below). The orchestrator
+# `run_batch_rsa` simply wires the stages together. This keeps the workflow
+# easy to reason about and lets future features (cost/SE, k-paths, protection,
+# regeneration) plug into a single stage without touching the others.
+#
+#   prepare  -> RsaContext            (design network, build per-link slot grid)
+#   parse    -> list[PathRequest]     (requests JSON -> demand objects)
+#   offer    -> list[PathRequest]     (replicate to traffic load, normalize)
+#   route    -> RouteResult           (per demand: constrained path)
+#   feasible -> FeasibilityResult     (per demand: GNPy GSNR vs required OSNR)
+#   assign   -> SpectrumResult        (per demand: first/last-fit slot search)
+#   commit   -> mutates oms_list      (occupy slots, record the service)
+#   aggregate-> BatchResult dict      (blocking, capacity, curves, utilization)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RsaContext:
+    """Prepared, immutable environment shared by every stage of one batch run."""
+    equipment: Any
+    network: Any
+    oms_list: list
+    sys_margins: float
+    policy: str
+    trx_uids: List[str]
+
+
+@dataclass
+class RouteResult:
+    """Output of the routing stage."""
+    path: list                       # ordered network elements (empty => no route)
+    reason: Optional[str] = None     # e.g. 'NO_PATH'
+
+
+@dataclass
+class FeasibilityResult:
+    """Output of the GSNR feasibility stage."""
+    feasible: bool
+    margin_db: Optional[float] = None
+    mean_gsnr_db: Optional[float] = None
+    reason: Optional[str] = None     # None, 'GSNR', 'NO_MODE', 'GSNR_ERROR'
+
+
+@dataclass
+class SpectrumResult:
+    """Output of the spectrum-assignment stage (search only; commit is separate)."""
+    assigned: bool
+    center_n: Optional[int] = None
+    m: Optional[int] = None
+    nb_wl: Optional[int] = None
+    path_oms: list = field(default_factory=list)
+    slots: Optional[int] = None      # number of occupied 6.25 GHz grid slots
+    reason: Optional[str] = None     # None or 'NO_SPECTRUM'
+
+
+@dataclass
+class DemandOutcome:
+    """Per-demand result row produced by the orchestrator."""
+    request_id: str
+    source: str
+    destination: str
+    mode: str
+    bitrate_gbps: float
+    path_bw_gbps: float
+    gsnr_mean_db: Optional[float]
+    gsnr_margin_db: Optional[float]
+    slots: Optional[int]
+    status: str                      # 'PROVISIONED' or 'BLOCKED'
+    reason: str
+    offered_bits: float
+    provisioned_bits: float
+
+
+def rsa_prepare(equipment, network, requests_data) -> RsaContext:
+    """Stage 1 - Prepare. Validate inputs, design the network (insert amps/set gains)
+    and build the per-link OMS slot grid.
+
+    In:  equipment, network, requests_data (parsed JSON dict)
+    Out: RsaContext (deep-copied, designed network + oms_list + run settings)
+    """
+    if not requests_data or not requests_data.get('path-request'):
+        raise ValueError("No 'path-request' entries found in the requests JSON.")
+
+    equipment = deepcopy(equipment)
+    network = deepcopy(network)
+
+    trx_uids = [n.uid for n in network.nodes() if isinstance(n, Transceiver)]
+    if len(trx_uids) < 2:
+        raise ValueError("Network needs at least two transceivers for batch RSA.")
+
+    designed_network(equipment, network, trx_uids[0], trx_uids[1], nodes_list=[], loose_list=[],
+                     args_power=None, no_insert_edfas=False)
+    oms_list = build_oms_list(network, equipment)
+    sys_margins = float(getattr(equipment['SI']['default'], 'sys_margins', 0.0) or 0.0)
+
+    return RsaContext(equipment=equipment, network=network, oms_list=oms_list,
+                      sys_margins=sys_margins, policy=FIRST_FIT, trx_uids=trx_uids)
+
+
+def rsa_parse_demands(requests_data, ctx: RsaContext) -> list:
+    """Stage 2 - Parse. Turn the requests JSON into GNPy PathRequest objects and
+    resolve/validate their route node names.
+
+    In:  requests_data, ctx
+    Out: list[PathRequest] (the base demand catalogue)
+    """
+    base_rqs = requests_from_json(requests_data, ctx.equipment)
     try:
-        from gnpy.core.utils import dbm2watt
-        from statistics import mean
-        
-        # Get spectral info from equipment
-        si = equipment['SI']['default']
-
-        def _to_hz(value, scale):
-            if value is None:
-                return None
-            try:
-                value_f = float(value)
-            except (TypeError, ValueError):
-                return None
-            if value_f < 1e6:
-                return value_f * scale
-            return value_f
-
-        def _get_si_attr(name, alt_name=None):
-            if hasattr(si, name):
-                return getattr(si, name)
-            if alt_name and hasattr(si, alt_name):
-                return getattr(si, alt_name)
-            return None
+        base_rqs = correct_json_route_list(ctx.network, base_rqs)
+    except Exception:
+        pass  # fall back to raw names; routing will flag NO_PATH per demand
+    return base_rqs
 
 
-     
-        spacing_hz = _to_hz(spacing, 1e9) or _to_hz(_get_si_attr('spacing'), 1e9) or 50.0e9
-        f_min_hz = _to_hz(min_freq, 1e12) or _to_hz(_get_si_attr('f_min'), 1e12) or 191.3e12
-        f_max_hz = _to_hz(max_freq, 1e12) or _to_hz(_get_si_attr('f_max'), 1e12) or 196.1e12
-        baud_rate_hz = _to_hz(baudrate, 1e9) or _to_hz(_get_si_attr('baud_rate', 'baudrate'), 1e9) or 31.57e9
-        roll_off_attr = _get_si_attr('roll_off', 'rolloff')
-        roll_off_val = float(rolloff) if rolloff is not None else (float(roll_off_attr) if roll_off_attr is not None else 0.15)
-        tx_osnr_val = float(tx_osnr) if tx_osnr is not None else (float(_get_si_attr('tx_osnr')) if _get_si_attr('tx_osnr') is not None else 35.0)
+def rsa_build_offered(base_rqs, n_requests, shuffle_seed) -> list:
+    """Stage 3 - Offer. Build the offered traffic sequence by replicating the base
+    demands cyclically up to the requested load, normalizing each for routing.
 
-        # Create comprehensive path request with all required parameters
-        params = {
-            'request_id': 'req1',
-            'source': source,
-            'destination': destination,
-            'bidir': bidir,
-            'trx_type': trx_type,
-            'trx_mode': None,
-            'format': None,
-            'spacing': spacing_hz,
-            'power': dbm2watt(launch_power),
-            'tx_power': dbm2watt(launch_power),
-            'nb_channel': 96,
-            'f_min': f_min_hz,
-            'f_max': f_max_hz,
-            'baud_rate': baud_rate_hz,
-            'bit_rate': None,
-            'roll_off': roll_off_val,
-            'OSNR': None,
-            'penalties': None,
-            'tx_osnr': tx_osnr_val,
-            'min_spacing': None,
-            'cost':     None,
-            'path_bandwidth':   None,
-            'effective_freq_slot':  None,
-            'equalization_offset_db':   None,
-            'nodes_list': nodes_list,
-            'loose_list': loose_list
-        }
-        
-        request = PathRequest(**params)
-        
-        
+    In:  base_rqs, n_requests (offered load), shuffle_seed (or None)
+    Out: list[PathRequest] in arrival order
+    """
+    import random as _random
 
-        # Compute path
-        paths = compute_path_dsjctn(network, equipment, [request], [])
-        # st.markdown(f"Computed paths: {paths}")
-        if paths and len(paths) > 0:
-            path = paths[0]
-            dest_trx = path[-1]
-            path_elements = [e.uid for e in path]
-            # Store path in session state for visualization
-            st.session_state.highlighted_path = path_elements
-            
-            # Store results
-            osnr_val = mean(dest_trx.osnr_ase) if hasattr(dest_trx, 'osnr_ase') and dest_trx.osnr_ase is not None else "N/A"
-            osnr_01nm = mean(dest_trx.osnr_ase_01nm) if hasattr(dest_trx, 'osnr_ase_01nm') and dest_trx.osnr_ase_01nm is not None else "N/A"
-            
-            st.session_state.simulation_results = {
-                'success': True,
-                'path_elements': path_elements,
-                'path_length': len(path),
-                'osnr_ase': osnr_val,
-                'osnr_01nm': osnr_01nm
-                
-            }
-            st.session_state.simulation_error = None
+    n_base = len(base_rqs)
+    n_requests = max(1, int(n_requests))
+    offered = []
+    for k in range(n_requests):
+        rq = deepcopy(base_rqs[k % n_base])
+        rq.request_id = f"{base_rqs[k % n_base].request_id}#{k + 1}"
+        if hasattr(rq, 'blocking_reason'):
+            delattr(rq, 'blocking_reason')
+        # compute_constrained_path requires nodes_list to end with the destination
+        if not rq.nodes_list or rq.nodes_list[-1] != rq.destination:
+            rq.nodes_list = list(rq.nodes_list) + [rq.destination]
+            rq.loose_list = list(rq.loose_list) + ['STRICT']
+        offered.append(rq)
+    if shuffle_seed is not None:
+        _random.Random(int(shuffle_seed)).shuffle(offered)
+    return offered
+
+
+def rsa_route(ctx: RsaContext, demand) -> RouteResult:
+    """Stage 4 - Route. Compute the constrained shortest path for one demand.
+
+    In:  ctx, demand (PathRequest)
+    Out: RouteResult
+    """
+    try:
+        path = compute_constrained_path(ctx.network, demand)
+    except Exception:
+        path = []
+    if not path:
+        return RouteResult(path=[], reason='NO_PATH')
+    return RouteResult(path=path)
+
+
+def rsa_feasibility(ctx: RsaContext, demand, path, gsnr_cache: dict) -> FeasibilityResult:
+    """Stage 5 - Feasibility. Propagate the demand with GNPy and compare the worst-case
+    GSNR (0.1 nm, minus penalties) to the required OSNR + system margin. Results are
+    cached per (OD, mode) since GSNR depends on the path, not on slot occupancy.
+
+    In:  ctx, demand, path, gsnr_cache (mutated)
+    Out: FeasibilityResult (also resolves the transponder mode onto `demand`)
+    """
+    def _apply(c):
+        if c.get('bit_rate') is not None:
+            demand.bit_rate = c['bit_rate']
+        if c.get('baud_rate') is not None:
+            demand.baud_rate = c['baud_rate']
+        if c.get('OSNR') is not None:
+            demand.OSNR = c['OSNR']
+        return FeasibilityResult(feasible=c['feasible'], margin_db=c['margin'],
+                                 mean_gsnr_db=c['mean_gsnr'], reason=c['reason'])
+
+    key = (demand.source, demand.destination, demand.baud_rate,
+           round(float(demand.spacing), 3), tuple(demand.nodes_list))
+    if key in gsnr_cache:
+        return _apply(gsnr_cache[key])
+
+    pp = deepcopy(path)
+    try:
+        if demand.baud_rate is not None:
+            propagate(pp, demand, ctx.equipment)
         else:
-            st.session_state.simulation_results = {'success': False}
-            st.session_state.simulation_error = "No path found between source and destination."
-        
-        
+            pp, mode = propagate_and_optimize_mode(pp, demand, ctx.equipment)
+            if mode is None:
+                gsnr_cache[key] = dict(feasible=False, margin=None, mean_gsnr=None, reason='NO_MODE',
+                                       bit_rate=None, baud_rate=None, OSNR=None)
+                return _apply(gsnr_cache[key])
+            demand.baud_rate, demand.OSNR, demand.bit_rate = mode['baud_rate'], mode['OSNR'], mode['bit_rate']
+        snr01 = np.asarray(pp[-1].snr_01nm, dtype=float)
+        pen = np.asarray(getattr(pp[-1], 'total_penalty', 0.0), dtype=float)
+        margin = float(np.min(snr01 - pen)) - (float(demand.OSNR or 0.0) + ctx.sys_margins)
+        gsnr_cache[key] = dict(feasible=margin >= 0, margin=margin, mean_gsnr=float(np.mean(snr01)),
+                               reason=None if margin >= 0 else 'GSNR',
+                               bit_rate=demand.bit_rate, baud_rate=demand.baud_rate, OSNR=demand.OSNR)
+    except Exception:
+        gsnr_cache[key] = dict(feasible=False, margin=None, mean_gsnr=None, reason='GSNR_ERROR',
+                               bit_rate=None, baud_rate=None, OSNR=None)
+    return _apply(gsnr_cache[key])
 
 
-        
+def rsa_assign_spectrum(ctx: RsaContext, demand, path) -> SpectrumResult:
+    """Stage 6 - Assign. Find a free contiguous slot block on the union of the path's
+    OMS using the configured first/last-fit policy. Does NOT commit (see rsa_commit).
 
+    In:  ctx, demand, path
+    Out: SpectrumResult
+    """
+    pb = float(demand.path_bandwidth or demand.bit_rate or 0.0)
+    nb_wl, required_m = compute_spectrum_slot_vs_bandwidth(pb or demand.bit_rate, demand.spacing, demand.bit_rate)
+    path_oms = build_path_oms_id_list(path)
+    if not path_oms:
+        return SpectrumResult(assigned=False, reason='NO_PATH')
+    agg = aggregate_oms_bitmap(path_oms, ctx.oms_list)
+    center_n, _startn, _stopn = spectrum_selection(agg, required_m, None, ctx.policy)
+    if center_n is None:
+        return SpectrumResult(assigned=False, path_oms=path_oms, reason='NO_SPECTRUM')
+    return SpectrumResult(assigned=True, center_n=int(center_n), m=int(required_m), nb_wl=nb_wl,
+                          path_oms=path_oms, slots=2 * int(required_m))
+
+
+def rsa_commit(ctx: RsaContext, demand, spectrum: SpectrumResult) -> None:
+    """Stage 7 - Commit. Mark the selected slots occupied on every OMS of the path and
+    record the demand as a service (mutates ctx.oms_list).
+    """
+    for oms_id in spectrum.path_oms:
+        ctx.oms_list[oms_id].assign_spectrum(spectrum.center_n, spectrum.m)
+        ctx.oms_list[oms_id].add_service(demand.request_id, spectrum.nb_wl)
+
+
+def rsa_process_demand(ctx: RsaContext, demand, gsnr_cache: dict) -> DemandOutcome:
+    """Run one demand through route -> feasibility -> assign -> commit and return its outcome."""
+    offered_bits = float(demand.path_bandwidth or demand.bit_rate or 0.0)
+    status, reason, slots = 'PROVISIONED', None, None
+    margin = mean_gsnr = None
+
+    route = rsa_route(ctx, demand)
+    if not route.path:
+        status, reason = 'BLOCKED', route.reason or 'NO_PATH'
+    else:
+        feas = rsa_feasibility(ctx, demand, route.path, gsnr_cache)
+        margin, mean_gsnr = feas.margin_db, feas.mean_gsnr_db
+        if not feas.feasible:
+            status, reason = 'BLOCKED', feas.reason or 'GSNR'
+        else:
+            spec = rsa_assign_spectrum(ctx, demand, route.path)
+            if not spec.assigned:
+                status, reason = 'BLOCKED', spec.reason or 'NO_SPECTRUM'
+            else:
+                rsa_commit(ctx, demand, spec)
+                slots = spec.slots
+
+    # recompute offered bits after feasibility may have resolved a mode
+    offered_bits = float(demand.path_bandwidth or demand.bit_rate or offered_bits or 0.0)
+    provisioned_bits = offered_bits if status == 'PROVISIONED' else 0.0
+
+    return DemandOutcome(
+        request_id=demand.request_id,
+        source=remove_type_from_nodeUid(str(demand.source)),
+        destination=remove_type_from_nodeUid(str(demand.destination)),
+        mode=f"{demand.tsp or ''} {demand.tsp_mode or ''}".strip(),
+        bitrate_gbps=round(float(demand.bit_rate or 0.0) * 1e-9, 1),
+        path_bw_gbps=round(offered_bits * 1e-9, 1),
+        gsnr_mean_db=round(mean_gsnr, 2) if mean_gsnr is not None else None,
+        gsnr_margin_db=round(margin, 2) if margin is not None else None,
+        slots=slots,
+        status=status,
+        reason=reason or '',
+        offered_bits=offered_bits,
+        provisioned_bits=provisioned_bits,
+    )
+
+
+def rsa_aggregate(ctx: RsaContext, outcomes: List[DemandOutcome], n_base: int,
+                  unique_gsnr_evals: int) -> dict:
+    """Stage 8 - Aggregate. Roll up per-demand outcomes and per-link occupancy into the
+    reporting payload (blocking probability, capacity, growth curves, utilization).
+
+    In:  ctx, outcomes (ordered by arrival), n_base, unique_gsnr_evals
+    Out: BatchResult dict (stored in session_state and consumed by render_batch_rsa)
+    """
+    cum_offered = cum_blocked = 0
+    cum_capacity = offered_capacity = 0.0
+    curve_load, curve_block, curve_capacity = [], [], []
+    causes = {'NO_PATH': 0, 'GSNR': 0, 'NO_SPECTRUM': 0, 'NO_MODE': 0, 'GSNR_ERROR': 0}
+    records = []
+
+    for o in outcomes:
+        cum_offered += 1
+        offered_capacity += o.offered_bits
+        if o.status == 'BLOCKED':
+            cum_blocked += 1
+            causes[o.reason] = causes.get(o.reason, 0) + 1
+        else:
+            cum_capacity += o.provisioned_bits
+        curve_load.append(cum_offered)
+        curve_block.append(cum_blocked / cum_offered)
+        curve_capacity.append(cum_capacity * 1e-12)
+        records.append({
+            'request_id': o.request_id, 'source': o.source, 'destination': o.destination,
+            'mode': o.mode, 'bitrate_gbps': o.bitrate_gbps, 'path_bw_gbps': o.path_bw_gbps,
+            'GSNR_mean_db': o.gsnr_mean_db, 'GSNR_margin_db': o.gsnr_margin_db,
+            'slots_6p25GHz': o.slots, 'status': o.status, 'reason': o.reason,
+        })
+
+    oms_util = []
+    for om in ctx.oms_list:
+        bm = om.spectrum_bitmap.bitmap
+        usable = sum(1 for b in bm if b != BitmapValue.UNUSABLE)
+        occupied = sum(1 for b in bm if b == BitmapValue.OCCUPIED)
+        oms_util.append({
+            'oms_id': om.oms_id,
+            'link': f"{remove_type_from_nodeUid(om.el_id_list[0])} → {remove_type_from_nodeUid(om.el_id_list[-1])}",
+            'utilization': (occupied / usable) if usable else 0.0,
+            'services': len(om.service_list),
+        })
+
+    return {
+        'policy': ctx.policy,
+        'n_base': n_base,
+        'n_offered': cum_offered,
+        'n_provisioned': cum_offered - cum_blocked,
+        'n_blocked': cum_blocked,
+        'blocking_prob': (cum_blocked / cum_offered) if cum_offered else 0.0,
+        'provisioned_tbps': cum_capacity * 1e-12,
+        'offered_tbps': offered_capacity * 1e-12,
+        'causes': {k: v for k, v in causes.items()},
+        'curve_load': curve_load,
+        'curve_block': curve_block,
+        'curve_capacity': curve_capacity,
+        'records': records,
+        'oms_util': oms_util,
+        'unique_gsnr_evals': unique_gsnr_evals,
+    }
+
+
+def run_batch_rsa(equipment, network, requests_data, n_requests, shuffle_seed, policy_label):
+    """Batch multi-request RSA orchestrator (XLRON-style, using GNPy GSNR for feasibility).
+
+    Wires the pipeline stages: prepare -> parse -> offer -> (route -> feasibility ->
+    assign -> commit per demand) -> aggregate. Demands arrive one-by-one so the growth
+    curves describe blocking probability and provisioned capacity vs offered load.
+    Results are written to st.session_state.batch_rsa (or batch_rsa_error on failure).
+    """
+    try:
+        ctx = rsa_prepare(equipment, network, requests_data)
+        ctx.policy = LAST_FIT if str(policy_label).lower().startswith('last') else FIRST_FIT
+
+        base_rqs = rsa_parse_demands(requests_data, ctx)
+        offered = rsa_build_offered(base_rqs, n_requests, shuffle_seed)
+
+        gsnr_cache = {}
+        outcomes = [rsa_process_demand(ctx, demand, gsnr_cache) for demand in offered]
+
+        st.session_state.batch_rsa = rsa_aggregate(ctx, outcomes, len(base_rqs), len(gsnr_cache))
+        st.session_state.batch_rsa_error = None
     except Exception as e:
-        st.session_state.simulation_results = {'success': False}
-        st.session_state.simulation_error = str(e)
+        st.session_state.batch_rsa = None
+        st.session_state.batch_rsa_error = str(e)
+
 
 def _summary_band(values):
     """Return (mean, min, max) of a per-channel metric list, ignoring non-finite entries."""
@@ -721,6 +1042,116 @@ def render_power_optimization(power_opt):
     })
     with st.expander("View GSNR-vs-power table"):
         st.dataframe(table, use_container_width=True, hide_index=True)
+
+
+def render_sim_inputs_preview(source, destination, nodes_list, loose_list, launch_power, trx_type, bidir):
+    """Summarize the inputs configured for the single-path simulation (shown once a source and
+    destination are selected, before the run). This reflects the values the run will be launched
+    with so the user can review them up front."""
+    ss = st.session_state
+    constraints = ", ".join(
+        f"{remove_type_from_nodeUid(str(n))} [{lt}]"
+        for n, lt in zip(nodes_list or [], loose_list or [])
+    ) or "—"
+
+    def _f(key, default=0.0):
+        v = ss.get(key, default)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    spacing_ghz = _f('sim_spacing')
+    fmin_thz = _f('sim_min_freq')
+    fmax_thz = _f('sim_max_freq')
+    try:
+        nch = automatic_nch(fmin_thz * 1e12, fmax_thz * 1e12, spacing_ghz * 1e9)
+    except Exception:
+        nch = None
+
+    rows = [
+        ("Path", "Source", remove_type_from_nodeUid(str(source))),
+        ("Path", "Destination", remove_type_from_nodeUid(str(destination))),
+        ("Path", "Include-node constraints", constraints),
+        ("Transceiver", "Type", str(trx_type)),
+        ("Transceiver", "Bidirectional", "Yes" if bidir else "No"),
+        ("Transceiver", "Launch power", f"{float(launch_power):.1f} dBm"),
+        ("Transceiver", "Baud rate", f"{_f('sim_baudrate'):.2f} GBaud"),
+        ("Transceiver", "Roll-off", f"{_f('sim_rolloff'):.2f}"),
+        ("Transceiver", "Tx OSNR", f"{_f('sim_tx_osnr'):.1f} dB"),
+        ("Transceiver", "System margin", f"{_f('sim_margin'):.1f} dB"),
+        ("Spectral load", "Channel spacing", f"{spacing_ghz:.2f} GHz"),
+        ("Spectral load", "Frequency range", f"{fmin_thz:.2f} – {fmax_thz:.2f} THz"),
+        ("Spectral load", "Channels (auto)", str(nch) if nch is not None else "—"),
+    ]
+    p_start, p_stop, p_step = _f('sim_pwr_start'), _f('sim_pwr_stop'), _f('sim_pwr_step')
+    if p_start is not None and p_stop is not None and p_step:
+        rows.append(("Power sweep", "Range (optimization)",
+                     f"{p_start:.1f} → {p_stop:.1f} dBm, step {p_step:.2f}"))
+
+    st.dataframe(pd.DataFrame(rows, columns=["Group", "Parameter", "Value"]),
+                 use_container_width=True, hide_index=True)
+
+
+def render_batch_rsa(result):
+    """Render batch RSA results: blocking probability, provisioned capacity, blocking-vs-load and
+    capacity-vs-load curves, per-link spectral utilization, and a per-request outcome table."""
+    if not result:
+        st.info("No batch results. Configure the load and run the batch RSA engine.")
+        return
+
+    bp = result['blocking_prob']
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Blocking probability", f"{bp * 100:.2f} %")
+    c2.metric("Provisioned", f"{result['n_provisioned']} / {result['n_offered']}")
+    c3.metric("Provisioned capacity", f"{result['provisioned_tbps']:.2f} Tb/s")
+    c4.metric("Offered capacity", f"{result['offered_tbps']:.2f} Tb/s")
+
+    causes = {k: v for k, v in result['causes'].items() if v}
+    if causes:
+        st.caption("Blocking causes: " + ", ".join(f"{k}: {v}" for k, v in causes.items())
+                   + f"  ·  policy: {result['policy']}  ·  unique GSNR evaluations: {result['unique_gsnr_evals']}")
+
+    # ---- blocking probability & provisioned capacity vs offered load ----
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Scatter(
+        x=result['curve_load'], y=[b * 100 for b in result['curve_block']],
+        mode='lines', name='Blocking probability', line=dict(color='#d62728', width=3),
+        hovertemplate='After %{x} demands<br>Blocking %{y:.2f}%<extra></extra>'
+    ), secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=result['curve_load'], y=result['curve_capacity'],
+        mode='lines', name='Provisioned capacity', line=dict(color='#1f77b4', width=2, dash='dash'),
+        hovertemplate='After %{x} demands<br>%{y:.2f} Tb/s<extra></extra>'
+    ), secondary_y=True)
+    fig.update_xaxes(title_text="Offered demands (cumulative arrivals)")
+    fig.update_yaxes(title_text="Blocking probability (%)", secondary_y=False)
+    fig.update_yaxes(title_text="Provisioned capacity (Tb/s)", secondary_y=True)
+    fig.update_layout(height=420, hovermode='x unified', margin=dict(t=30, b=0, l=0, r=0),
+                      legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='left', x=0))
+    st.plotly_chart(fig, use_container_width=True, key="batch_rsa_curve")
+
+    # ---- per-link spectral utilization (top links) ----
+    util_rows = [u for u in result['oms_util'] if u['services'] > 0]
+    util_rows.sort(key=lambda u: u['utilization'], reverse=True)
+    top = util_rows[:20]
+    if top:
+        st.markdown("**Per-link spectral utilization (busiest links)**")
+        ufig = go.Figure(go.Bar(
+            x=[u['utilization'] * 100 for u in top][::-1],
+            y=[u['link'] for u in top][::-1],
+            orientation='h',
+            marker_color=[u['utilization'] * 100 for u in top][::-1],
+            marker=dict(colorscale='YlOrRd', cmin=0, cmax=100),
+            hovertemplate='%{y}<br>%{x:.1f}% used<extra></extra>',
+        ))
+        ufig.update_layout(height=max(280, 22 * len(top)), xaxis_title="Slot utilization (%)",
+                           margin=dict(t=10, b=0, l=0, r=0), xaxis=dict(range=[0, 100]))
+        st.plotly_chart(ufig, use_container_width=True, key="batch_rsa_util")
+
+    # ---- per-request outcomes ----
+    with st.expander("Per-request outcomes"):
+        st.dataframe(pd.DataFrame(result['records']), use_container_width=True, hide_index=True)
 
 
 def flatten_dict(d, parent_key='', sep='_'):
@@ -1550,8 +1981,14 @@ with tab3:
             elif st.session_state.get('power_opt_error'):
                 st.error(f"❌ Power optimization failed: {st.session_state.power_opt_error}")
 
+            # Batch RSA / blocking-probability study
+            if st.session_state.get('batch_rsa'):
+                st.subheader("📦 Batch RSA — Blocking & Provisioned Capacity")
+                render_batch_rsa(st.session_state.batch_rsa)
+            elif st.session_state.get('batch_rsa_error'):
+                st.error(f"❌ Batch RSA failed: {st.session_state.batch_rsa_error}")
+
     with col2:
-        st.subheader("Optical Path Simulation")
         if network is None or equipment is None:
             st.error("Network or equipment failed to load. Check the error messages above.")
         else:
@@ -1564,270 +2001,277 @@ with tab3:
 
                 # Get available nodes
                 nodes = get_available_nodes()
-                source_options = [""] + nodes
-                dest_options = [""] + nodes
 
-                # Calculate selectbox indices based on current session state
-                source_index = 0
-                if st.session_state.source_select and st.session_state.source_select in source_options:
-                    source_index = source_options.index(st.session_state.source_select)
-                
-                dest_index = 0
-                if st.session_state.dest_select and st.session_state.dest_select in dest_options:
-                    dest_index = dest_options.index(st.session_state.dest_select)
+                # Workflow tabs (controls only; outputs render in col1 as before)
+                wf_single, wf_batch = st.tabs([
+                    "🔬 Single-Path Analysis",
+                    "📦 Batch RSA / Blocking",
+                ])
 
-                col1, col2 = st.columns(2)
+                with wf_single:
+                    source_options = [""] + nodes
+                    dest_options = [""] + nodes
 
-                with col1:
-                    source_node = st.selectbox(
-                        "Source node:",
-                        options=source_options,
-                        index=source_index,
-                        key='source_select'
+                    # Calculate selectbox indices based on current session state
+                    source_index = 0
+                    if st.session_state.source_select and st.session_state.source_select in source_options:
+                        source_index = source_options.index(st.session_state.source_select)
+
+                    dest_index = 0
+                    if st.session_state.dest_select and st.session_state.dest_select in dest_options:
+                        dest_index = dest_options.index(st.session_state.dest_select)
+
+                    sp_col1, sp_col2 = st.columns(2)
+
+                    with sp_col1:
+                        source_node = st.selectbox(
+                            "Source node:",
+                            options=source_options,
+                            index=source_index,
+                            key='source_select'
+                        )
+                        st.session_state.source_node = source_node if source_node else None
+
+                    with sp_col2:
+                        destination_node = st.selectbox(
+                            "Destination node:",
+                            options=dest_options,
+                            index=dest_index,
+                            key='dest_select'
+                        )
+                        st.session_state.destination_node = destination_node if destination_node else None
+
+                    st.subheader("Path Constraints")
+                    nodes_list = st.multiselect(
+                        "nodes_list:",
+                        options=nodes,
+                        default=st.session_state.get("constraint_nodes_list", []),
+                        key="constraint_nodes_list",
+                        help="Ordered list of nodes that the path should traverse."
                     )
-                    st.session_state.source_node = source_node if source_node else None
 
-                with col2:
-                    destination_node = st.selectbox(
-                        "Destination node:",
-                        options=dest_options,
-                        index=dest_index,
-                        key='dest_select'
+                    loose_list = []
+                    if nodes_list:
+                        st.markdown("loose_list:")
+                        for constrained_node in nodes_list:
+                            loose_key = f"constraint_type_{str(constrained_node).replace(' ', '_')}"
+                            hop_type = st.selectbox(
+                                f"{constrained_node} hop type",
+                                options=["LOOSE", "STRICT"],
+                                index=0,
+                                key=loose_key,
+                                help="STRICT enforces this hop; LOOSE allows alternate optimization."
+                            )
+                            loose_list.append(hop_type)
+
+                    source = st.session_state.source_node
+                    destination = st.session_state.destination_node
+
+                    if source and destination and source == destination:
+                        st.warning("Source and destination must be different nodes.")
+
+                    # Basic simulation settings
+                    st.subheader("Simulation Configuration")
+                    col_a, col_b, col_c = st.columns(3)
+
+                    with col_a:
+                        launch_power = st.slider("Launch Power (dBm)", -5, 5, 0)
+                    with col_b:
+                        trx_type = st.text_input("Transceiver Type", "Voyager")
+                    with col_c:
+                        bidir = st.checkbox("Bidirectional", value=False)
+
+                    si = equipment['SI']['default']
+
+                    def _si_default(attr, fallback, scale=1.0):
+                        """Read an SI reference attribute (Hz/dB) and convert to display units."""
+                        v = getattr(si, attr, None)
+                        try:
+                            return float(v) * scale if v is not None else fallback
+                        except (TypeError, ValueError):
+                            return fallback
+
+                    # Seed simulation parameters from the equipment SI reference channel (defaults).
+                    # These are display-unit copies; editing them never changes the SI library.
+                    if 'sim_margin' not in st.session_state:
+                        st.session_state.sim_margin = _si_default('sys_margins', 0.0)
+                    if 'sim_baudrate' not in st.session_state:
+                        st.session_state.sim_baudrate = _si_default('baud_rate', 31.57, 1e-9)
+                    if 'sim_rolloff' not in st.session_state:
+                        st.session_state.sim_rolloff = _si_default('roll_off', 0.15)
+                    if 'sim_tx_osnr' not in st.session_state:
+                        st.session_state.sim_tx_osnr = _si_default('tx_osnr', 40.0)
+                    if 'sim_spacing' not in st.session_state:
+                        st.session_state.sim_spacing = _si_default('spacing', 50.0, 1e-9)
+                    if 'sim_min_freq' not in st.session_state:
+                        st.session_state.sim_min_freq = _si_default('f_min', 191.30, 1e-12)
+                    if 'sim_max_freq' not in st.session_state:
+                        st.session_state.sim_max_freq = _si_default('f_max', 196.10, 1e-12)
+                    if 'sim_pwr_start' not in st.session_state:
+                        st.session_state.sim_pwr_start = -2.0
+                    if 'sim_pwr_stop' not in st.session_state:
+                        st.session_state.sim_pwr_stop = 4.0
+                    if 'sim_pwr_step' not in st.session_state:
+                        st.session_state.sim_pwr_step = 0.5
+
+                    # Set Transceiver Parameters
+                    with st.expander("Set Transceiver Parameters"):
+                        col_t1, col_t2 = st.columns(2)
+                        with col_t1:
+                            st.session_state.sim_margin = st.number_input(
+                                "Margin [dB]",
+                                value=float(st.session_state.sim_margin),
+                                step=0.1,
+                                key='trx_margin'
+                            )
+                            st.session_state.sim_baudrate = st.number_input(
+                                "Baudrate [Gbaud]",
+                                value=float(st.session_state.sim_baudrate),
+                                step=0.01,
+                                key='trx_baudrate'
+                            )
+                            st.session_state.sim_rolloff = st.number_input(
+                                "Roll-off",
+                                value=float(st.session_state.sim_rolloff),
+                                min_value=0.0,
+                                max_value=1.0,
+                                step=0.01,
+                                key='trx_rolloff'
+                            )
+                        with col_t2:
+                            st.session_state.sim_tx_osnr = st.number_input(
+                                "Tx OSNR [dB]",
+                                value=float(st.session_state.sim_tx_osnr),
+                                step=0.1,
+                                key='trx_tx_osnr'
+                            )
+
+                    # Spectral Load Parameters
+                    with st.expander("📡 Spectral Load Parameters"):
+                        col_s1, col_s2, col_s3 = st.columns(3)
+                        with col_s1:
+                            st.session_state.sim_spacing = st.number_input(
+                                "Spacing [GHz]",
+                                value=float(st.session_state.sim_spacing),
+                                step=0.01,
+                                key='spec_spacing'
+                            )
+                        with col_s2:
+                            st.session_state.sim_min_freq = st.number_input(
+                                "Minimum Frequency [THz]",
+                                value=float(st.session_state.sim_min_freq),
+                                step=0.01,
+                                format="%.2f",
+                                key='spec_min_freq'
+                            )
+                        with col_s3:
+                            st.session_state.sim_max_freq = st.number_input(
+                                "Maximum Frequency [THz]",
+                                value=float(st.session_state.sim_max_freq),
+                                step=0.01,
+                                format="%.2f",
+                                key='spec_max_freq'
+                            )
+
+                    # Reference Power and Sweep
+                    with st.expander("⚡ Reference Power and Sweep"):
+                        col_p1, col_p2, col_p3 = st.columns(3)
+                        with col_p1:
+                            st.session_state.sim_pwr_start = st.number_input(
+                                "Start [dBm]",
+                                value=float(st.session_state.sim_pwr_start),
+                                step=0.1,
+                                key='pwr_start'
+                            )
+                        with col_p2:
+                            st.session_state.sim_pwr_stop = st.number_input(
+                                "Stop [dBm]",
+                                value=float(st.session_state.sim_pwr_stop) if st.session_state.sim_pwr_stop is not None else 4.0,
+                                step=0.1,
+                                key='pwr_stop'
+                            )
+                        with col_p3:
+                            st.session_state.sim_pwr_step = st.number_input(
+                                "Step [dBm]",
+                                value=float(st.session_state.sim_pwr_step) if st.session_state.sim_pwr_step is not None else 0.1,
+                                step=0.01,
+                                key='pwr_step'
+                            )
+
+                    can_run_simulation = bool(source and destination and source != destination)
+
+                    if can_run_simulation:
+                        st.subheader("🧾 Simulation inputs to be used")
+                        render_sim_inputs_preview(source, destination, nodes_list, loose_list,
+                                                  launch_power, trx_type, bidir)
+                        st.caption(
+                            "These values are applied to the propagated reference channel — editing them "
+                            "changes the simulation. The equipment SI library defaults are left unchanged."
+                        )
+
+                    if st.button(
+                        "🚀 Run Transmission",
+                        type="primary",
+                        disabled=not can_run_simulation,
+                        on_click=run_transmission,
+                        args=(
+                            equipment, network, source, destination, launch_power, trx_type, bidir, st.session_state.sim_margin, st.session_state.sim_baudrate, st.session_state.sim_rolloff, st.session_state.sim_tx_osnr, st.session_state.sim_spacing, st.session_state.sim_min_freq, st.session_state.sim_max_freq, st.session_state.sim_pwr_start, st.session_state.sim_pwr_stop, st.session_state.sim_pwr_step, nodes_list, loose_list
+                        )
+                    ):
+                        pass  # Callback handles everything
+
+                    st.caption(
+                        "Optimization sweeps span input power from Start to Stop (Step) in the "
+                        "'⚡ Reference Power and Sweep' expander and picks the GSNR-maximising power."
                     )
-                    st.session_state.destination_node = destination_node if destination_node else None
+                    if st.button(
+                        "⚡ Optimize Launch Power",
+                        type="secondary",
+                        disabled=not can_run_simulation,
+                        on_click=run_power_optimization,
+                        args=(
+                            equipment, network, source, destination, launch_power, trx_type, bidir,
+                            st.session_state.sim_margin, st.session_state.sim_baudrate, st.session_state.sim_rolloff,
+                            st.session_state.sim_tx_osnr, st.session_state.sim_spacing,
+                            st.session_state.sim_min_freq, st.session_state.sim_max_freq,
+                            st.session_state.sim_pwr_start, st.session_state.sim_pwr_stop, st.session_state.sim_pwr_step,
+                            nodes_list, loose_list,
+                        )
+                    ):
+                        pass  # Callback handles everything
 
-                st.subheader("Path Constraints")
-                nodes_list = st.multiselect(
-                    "nodes_list:",
-                    options=nodes,
-                    default=st.session_state.get("constraint_nodes_list", []),
-                    key="constraint_nodes_list",
-                    help="Ordered list of nodes that the path should traverse."
-                )
+                with wf_batch:
+                    st.subheader("📦 Batch RSA / Blocking")
+                    n_base_req = len(requests_json.get('path-request', [])) if isinstance(requests_json, dict) else 0
+                    if n_base_req == 0:
+                        st.info("Load a requests JSON with 'path-request' entries to run the batch engine.")
+                    else:
+                        st.caption(
+                            f"{n_base_req} base demand(s) in the requests file. Demands are offered one-by-one "
+                            "(cumulative load); each is routed, GSNR-checked, then first/last-fit assigned on the "
+                            "per-link slot grid. Blocking = no path / GSNR fail / no spectrum."
+                        )
+                        bcol1, bcol2 = st.columns(2)
+                        with bcol1:
+                            n_offered = st.number_input(
+                                "Demands to offer (load)", min_value=1, max_value=100000,
+                                value=int(max(n_base_req, 50)), step=10, key='rsa_n_offered',
+                                help="Base demands are replicated cyclically to reach this offered load."
+                            )
+                        with bcol2:
+                            rsa_policy = st.selectbox("Spectrum policy", ["first_fit", "last_fit"], key='rsa_policy')
+                        rsa_shuffle = st.checkbox("Shuffle demand order", value=False, key='rsa_shuffle')
+                        rsa_seed = None
+                        if rsa_shuffle:
+                            rsa_seed = st.number_input("Shuffle seed", value=0, step=1, key='rsa_seed')
 
-                loose_list = []
-                if nodes_list:
-                    st.markdown("loose_list:")
-                    for constrained_node in nodes_list:
-                        loose_key = f"constraint_type_{str(constrained_node).replace(' ', '_')}"
-                        hop_type = st.selectbox(
-                            f"{constrained_node} hop type",
-                            options=["LOOSE", "STRICT"],
-                            index=0,
-                            key=loose_key,
-                            help="STRICT enforces this hop; LOOSE allows alternate optimization."
-                        )
-                        loose_list.append(hop_type)
-
-                source = st.session_state.source_node
-                destination = st.session_state.destination_node
-
-                if source and destination and source == destination:
-                    st.warning("Source and destination must be different nodes.")
-
-                # Basic simulation settings
-                st.subheader("Simulation Configuration")
-                col_a, col_b, col_c = st.columns(3)
-                
-                with col_a:
-                    launch_power = st.slider("Launch Power (dBm)", -5, 5, 0)
-                with col_b:
-                    trx_type = st.text_input("Transceiver Type", "Voyager")
-                with col_c:
-                    bidir = st.checkbox("Bidirectional", value=False)
-                
-
-                si = equipment['SI']['default']
-                # Initialize session state for simulation parameters
-                if 'sim_margin' not in st.session_state:
-                    st.session_state.sim_margin = 0.0
-                if 'sim_baudrate' not in st.session_state:
-                    st.session_state.sim_baudrate = float(si.baudrate) if hasattr(si, 'baudrate') and si.baudrate is not None else 31.57
-                if 'sim_rolloff' not in st.session_state:
-                    st.session_state.sim_rolloff = float(si.rolloff) if hasattr(si, 'rolloff') and si.rolloff is not None else 0.15
-                if 'sim_tx_osnr' not in st.session_state:
-                    st.session_state.sim_tx_osnr = float(si.tx_osnr) if hasattr(si, 'tx_osnr') and si.tx_osnr is not None else 35.0
-                if 'sim_min_osnr' not in st.session_state:
-                    st.session_state.sim_min_osnr = float(si.min_osnr) if hasattr(si, 'min_osnr') and si.min_osnr is not None else 0.0
-                if 'sim_spacing' not in st.session_state:
-                    st.session_state.sim_spacing = float(si.spacing) if hasattr(si, 'spacing') and si.spacing is not None else 50.00
-                if 'sim_min_freq' not in st.session_state:
-                    st.session_state.sim_min_freq = 191.30
-                if 'sim_max_freq' not in st.session_state:
-                    st.session_state.sim_max_freq = 196.10
-                if 'sim_roadm_osnr' not in st.session_state:
-                    st.session_state.sim_roadm_osnr = 33.0
-                if 'sim_pwr_start' not in st.session_state:
-                    st.session_state.sim_pwr_start = -2.0
-                if 'sim_pwr_stop' not in st.session_state:
-                    st.session_state.sim_pwr_stop = 4.0
-                if 'sim_pwr_step' not in st.session_state:
-                    st.session_state.sim_pwr_step = 0.5
-                
-                # Set Transceiver Parameters
-                with st.expander("Set Transceiver Parameters"):
-                    col_t1, col_t2 = st.columns(2)
-                    with col_t1:
-                        st.session_state.sim_margin = st.number_input(
-                            "Margin [dB]",
-                            value=float(st.session_state.sim_margin),
-                            step=0.1,
-                            key='trx_margin'
-                        )
-                        st.session_state.sim_baudrate = st.number_input(
-                            "Baudrate [Gbaud]",
-                            value=float(st.session_state.sim_baudrate),
-                            step=0.01,
-                            key='trx_baudrate'
-                        )
-                        st.session_state.sim_rolloff = st.number_input(
-                            "Roll-off",
-                            value=float(st.session_state.sim_rolloff),
-                            min_value=0.0,
-                            max_value=1.0,
-                            step=0.01,
-                            key='trx_rolloff'
-                        )
-                    with col_t2:
-                        st.session_state.sim_tx_osnr = st.number_input(
-                            "Tx OSNR [dB]",
-                            value=float(st.session_state.sim_tx_osnr),
-                            step=0.1,
-                            key='trx_tx_osnr'
-                        )
-                        st.session_state.sim_min_osnr = st.number_input(
-                            "Min OSNR [dB]",
-                            value=float(st.session_state.sim_min_osnr),
-                            step=0.1,
-                            key='trx_min_osnr'
-                        )
-                
-                # Spectral Load Parameters
-                with st.expander("📡 Spectral Load Parameters"):
-                    col_s1, col_s2, col_s3 = st.columns(3)
-                    with col_s1:
-                        st.session_state.sim_spacing = st.number_input(
-                            "Spacing [GHz]",
-                            value=float(st.session_state.sim_spacing),
-                            step=0.01,
-                            key='spec_spacing'
-                        )
-                    with col_s2:
-                        st.session_state.sim_min_freq = st.number_input(
-                            "Minimum Frequency [THz]",
-                            value=float(st.session_state.sim_min_freq),
-                            step=0.01,
-                            format="%.2f",
-                            key='spec_min_freq'
-                        )
-                    with col_s3:
-                        st.session_state.sim_max_freq = st.number_input(
-                            "Maximum Frequency [THz]",
-                            value=float(st.session_state.sim_max_freq),
-                            step=0.01,
-                            format="%.2f",
-                            key='spec_max_freq'
-                        )
-                
-                # ROADM Parameters
-                with st.expander("🛣️ ROADM Parameters"):
-                    st.session_state.sim_roadm_osnr = st.number_input(
-                        "Add/Drop OSNR [dB]",
-                        value=float(st.session_state.sim_roadm_osnr),
-                        step=0.1,
-                        key='roadm_osnr'
-                    )
-                
-                # Reference Power and Sweep
-                with st.expander("⚡ Reference Power and Sweep"):
-                    col_p1, col_p2, col_p3 = st.columns(3)
-                    with col_p1:
-                        st.session_state.sim_pwr_start = st.number_input(
-                            "Start [dBm]",
-                            value=float(st.session_state.sim_pwr_start),
-                            step=0.1,
-                            key='pwr_start'
-                        )
-                    with col_p2:
-                        st.session_state.sim_pwr_stop = st.number_input(
-                            "Stop [dBm]",
-                            value=float(st.session_state.sim_pwr_stop) if st.session_state.sim_pwr_stop is not None else 4.0,
-                            step=0.1,
-                            key='pwr_stop'
-                        )
-                    with col_p3:
-                        st.session_state.sim_pwr_step = st.number_input(
-                            "Step [dBm]",
-                            value=float(st.session_state.sim_pwr_step) if st.session_state.sim_pwr_step is not None else 0.1,
-                            step=0.01,
-                            key='pwr_step'
-                        )
-                
-                can_run_simulation = bool(source and destination and source != destination)
-                if st.button(
-                    "🚀 Run Simulation", 
-                    type="primary", 
-                    disabled=not can_run_simulation,
-                    on_click=run_simulation_callback,
-                    args=(
-                        network,
-                        equipment,
-                        source,
-                        destination,
-                        launch_power,
-                        trx_type,
-                        bidir,
-                        st.session_state.sim_margin,
-                        st.session_state.sim_baudrate,
-                        st.session_state.sim_rolloff,
-                        st.session_state.sim_tx_osnr,
-                        st.session_state.sim_min_osnr,
-                        st.session_state.sim_spacing,
-                        st.session_state.sim_min_freq,
-                        st.session_state.sim_max_freq,
-                        st.session_state.sim_roadm_osnr,
-                        st.session_state.sim_pwr_start,
-                        st.session_state.sim_pwr_stop,
-                        st.session_state.sim_pwr_step,
-                        nodes_list,
-                        loose_list,
-                    )
-                ):
-                    pass  # Callback handles everything
-
-
-                if st.button(
-                    "🚀 Run Transmission", 
-                    type="primary", 
-                    disabled=not can_run_simulation,
-                    on_click=run_transmission,
-                    args=(
-                        equipment, network, source, destination, launch_power, trx_type, bidir, st.session_state.sim_margin, st.session_state.sim_baudrate, st.session_state.sim_rolloff, st.session_state.sim_tx_osnr, st.session_state.sim_min_osnr, st.session_state.sim_spacing, st.session_state.sim_min_freq, st.session_state.sim_max_freq, st.session_state.sim_roadm_osnr, st.session_state.sim_pwr_start, st.session_state.sim_pwr_stop, st.session_state.sim_pwr_step
-                    )
-                ):
-                    pass  # Callback handles everything
-
-                st.caption(
-                    "Optimization sweeps span input power from Start to Stop (Step) in the "
-                    "'⚡ Reference Power and Sweep' expander and picks the GSNR-maximising power."
-                )
-                if st.button(
-                    "⚡ Optimize Launch Power",
-                    type="secondary",
-                    disabled=not can_run_simulation,
-                    on_click=run_power_optimization,
-                    args=(
-                        equipment, network, source, destination, launch_power, trx_type, bidir,
-                        st.session_state.sim_margin, st.session_state.sim_baudrate, st.session_state.sim_rolloff,
-                        st.session_state.sim_tx_osnr, st.session_state.sim_min_osnr, st.session_state.sim_spacing,
-                        st.session_state.sim_min_freq, st.session_state.sim_max_freq, st.session_state.sim_roadm_osnr,
-                        st.session_state.sim_pwr_start, st.session_state.sim_pwr_stop, st.session_state.sim_pwr_step,
-                        nodes_list, loose_list,
-                    )
-                ):
-                    pass  # Callback handles everything
-
-                # path, propagations, powers_dbm, infos, final_gsnr = run_transmission(equipment, network, source, destination, launch_power, trx_type, bidir, st.session_state.sim_margin, st.session_state.sim_baudrate, st.session_state.sim_rolloff, st.session_state.sim_tx_osnr, st.session_state.sim_min_osnr, st.session_state.sim_spacing, st.session_state.sim_min_freq, st.session_state.sim_max_freq, st.session_state.sim_roadm_osnr, st.session_state.sim_pwr_start, st.session_state.sim_pwr_stop, st.session_state.sim_pwr_step)
+                        if st.button(
+                            "📦 Run Batch RSA",
+                            type="secondary",
+                            on_click=run_batch_rsa,
+                            args=(equipment, network, requests_json, n_offered, rsa_seed, rsa_policy),
+                        ):
+                            pass  # Callback handles everything
 
 
 # Footer
