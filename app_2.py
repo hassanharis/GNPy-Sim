@@ -113,6 +113,14 @@ if 'batch_rsa' not in st.session_state:
     st.session_state.batch_rsa = None
 if 'batch_rsa_error' not in st.session_state:
     st.session_state.batch_rsa_error = None
+if 'path_candidates' not in st.session_state:
+    st.session_state.path_candidates = None
+if 'selected_path' not in st.session_state:
+    st.session_state.selected_path = None
+if 'route_signature' not in st.session_state:
+    st.session_state.route_signature = None
+if 'route_error' not in st.session_state:
+    st.session_state.route_error = None
 if 'simulation_error' not in st.session_state:
     st.session_state.simulation_error = None
    
@@ -373,6 +381,93 @@ def _build_service_req(equipment, source, destination, trx_type, trx_mode, spaci
         'loose_list': list(loose_list),
     }
     return PathRequest(**params)
+
+
+def _is_subsequence(needles, haystack):
+    """True if `needles` appears as an ordered (not necessarily contiguous) subsequence of `haystack`."""
+    it = iter(haystack)
+    return all(n in it for n in needles)
+
+
+def compute_candidate_paths(equipment, network, source, destination, nodes_list=None, loose_list=None, k=3,
+                            topology_uids=None):
+    """Compute up to k distance-ordered candidate routes between two transceivers (k-shortest).
+
+    The network is designed on a private copy (to insert amps and set fiber-length edge weights),
+    then networkx `shortest_simple_paths` yields routes in increasing length. Each candidate records
+    its ordered ROADM sequence (used to pin the route for analysis) plus span/length summaries.
+
+    `topology_uids` (optional set) restricts the returned `element_uids` to elements present in the
+    original topology, so highlighting on the topology map matches (the designed network has extra
+    auto-inserted EDFAs that don't exist on the map).
+
+    Returns a list of dicts: {index, roadm_sequence, element_uids, hops, n_spans, length_km}.
+    """
+    from copy import deepcopy as _deepcopy
+    import networkx as _nx
+
+    equipment = _deepcopy(equipment)
+    network = _deepcopy(network)
+    designed_network(equipment, network, source, destination, nodes_list=[], loose_list=[],
+                     args_power=None, no_insert_edfas=False)
+
+    try:
+        src_el = next(n for n in network.nodes() if isinstance(n, Transceiver) and n.uid == source)
+        dst_el = next(n for n in network.nodes() if isinstance(n, Transceiver) and n.uid == destination)
+    except StopIteration:
+        return []
+
+    include = [n for n in (nodes_list or []) if n]
+    candidates = []
+    try:
+        gen = _nx.shortest_simple_paths(network, src_el, dst_el, weight='weight')
+    except Exception:
+        return []
+
+    for path in gen:
+        uids = [e.uid for e in path]
+        if include and not _is_subsequence(include, uids):
+            continue
+        roadms = [e.uid for e in path if isinstance(e, Roadm)]
+        spans = [float(getattr(e.params, 'length', 0.0)) for e in path if isinstance(e, (Fiber, RamanFiber))]
+        # For map highlighting, keep only elements that exist in the original topology (drop
+        # auto-inserted EDFAs) so consecutive pairs match the topology connections.
+        highlight_uids = [u for u in uids if u in topology_uids] if topology_uids else uids
+
+        # Build a station/segment breakdown for the route schematic: stations are TRX/ROADM nodes,
+        # segments are the links between consecutive stations (fiber length + amp count).
+        stations, segments = [], []
+        cur = {'length_m': 0.0, 'n_spans': 0, 'n_amps': 0}
+        for el in path:
+            if isinstance(el, (Transceiver, Roadm)):
+                if stations:
+                    segments.append({'length_km': round(cur['length_m'] / 1000.0, 1),
+                                     'n_spans': cur['n_spans'], 'n_amps': cur['n_amps']})
+                stations.append({'uid': el.uid, 'type': type(el).__name__,
+                                 'label': remove_type_from_nodeUid(el.uid)})
+                cur = {'length_m': 0.0, 'n_spans': 0, 'n_amps': 0}
+            elif isinstance(el, (Fiber, RamanFiber)):
+                cur['length_m'] += float(getattr(el.params, 'length', 0.0))
+                cur['n_spans'] += 1
+            elif isinstance(el, Fused):
+                pass  # passive, not an amp
+            else:
+                cur['n_amps'] += 1  # EDFA / multiband amplifier
+
+        candidates.append({
+            'index': len(candidates),
+            'roadm_sequence': roadms,
+            'element_uids': highlight_uids,
+            'hops': len(roadms),
+            'n_spans': len(spans),
+            'n_amps': sum(s['n_amps'] for s in segments),
+            'length_km': round(sum(spans) / 1000.0, 1),
+            'stations': stations,
+            'segments': segments,
+        })
+        if len(candidates) >= max(1, int(k)):
+            break
+    return candidates
 
 
 def _resolve_best_mode(equipment, network, service_req, launch_power_dbm):
@@ -1301,6 +1396,212 @@ def render_sim_inputs_preview(equipment, source, destination, nodes_list, loose_
         st.caption(f"Power sweep (optimization): {p_start:.1f} → {p_stop:.1f} dBm, step {p_step:.2f}")
 
 
+def render_route_schematic(selected_path):
+    """Horizontal schematic of the locked route: TRX/ROADM stations positioned by cumulative
+    distance, with per-link length and amplifier counts annotated, plus a route summary."""
+    stations = selected_path.get('stations') or []
+    segments = selected_path.get('segments') or []
+    if not stations:
+        st.info("No route detail available.")
+        return
+
+    xs = [0.0]
+    for seg in segments:
+        xs.append(xs[-1] + float(seg.get('length_km', 0.0)))
+    if (xs[-1] if xs else 0) <= 0:  # degenerate (all zero) -> equal spacing
+        xs = [float(i) for i in range(len(stations))]
+
+    TRX_Y = 0.6  # raise transceivers above the ROADM backbone so co-located markers don't overlap
+    trx_idx = [i for i, s in enumerate(stations) if s['type'] == 'Transceiver']
+    roadm_idx = [i for i, s in enumerate(stations) if s['type'] == 'Roadm']
+
+    fig = go.Figure()
+    # ROADM backbone line (y=0)
+    fig.add_trace(go.Scatter(x=xs, y=[0] * len(xs), mode='lines',
+                             line=dict(color='#bbbbbb', width=4), hoverinfo='skip', showlegend=False))
+    # dotted add/drop connectors from each TRX down to the backbone
+    for i in trx_idx:
+        fig.add_trace(go.Scatter(x=[xs[i], xs[i]], y=[0, TRX_Y], mode='lines',
+                                 line=dict(color='#2ca02c', width=2, dash='dot'),
+                                 hoverinfo='skip', showlegend=False))
+    # ROADM markers on the line (labels below) — type shown only via the legend/colour, not per node
+    if roadm_idx:
+        fig.add_trace(go.Scatter(
+            x=[xs[i] for i in roadm_idx], y=[0] * len(roadm_idx), mode='markers+text',
+            marker=dict(size=20, color='#1f77b4', symbol='circle', line=dict(width=2, color='white')),
+            text=[stations[i]['label'] for i in roadm_idx], textposition='bottom center', name='ROADM',
+            hovertext=[stations[i]['label'] for i in roadm_idx], hoverinfo='text',
+        ))
+    # TRX markers raised above (labels above)
+    if trx_idx:
+        fig.add_trace(go.Scatter(
+            x=[xs[i] for i in trx_idx], y=[TRX_Y] * len(trx_idx), mode='markers+text',
+            marker=dict(size=18, color='#2ca02c', symbol='square', line=dict(width=2, color='white')),
+            text=[stations[i]['label'] for i in trx_idx], textposition='top center', name='TRX',
+            hovertext=[stations[i]['label'] for i in trx_idx], hoverinfo='text',
+        ))
+    # per-link length/amp annotations above the backbone
+    for i, seg in enumerate(segments):
+        midx = (xs[i] + xs[i + 1]) / 2
+        km, amps = seg.get('length_km', 0.0), seg.get('n_amps', 0)
+        if km <= 0 and amps == 0:
+            continue
+        label = f"{km:.0f} km" + (f" · {amps} amp" if amps else "")
+        fig.add_annotation(x=midx, y=0, text=label, showarrow=False, yshift=18,
+                           font=dict(size=11, color='#555'))
+    fig.update_layout(
+        height=280, margin=dict(t=30, b=20, l=10, r=10),
+        xaxis=dict(title="Distance along route (km)", zeroline=False),
+        yaxis=dict(visible=False, range=[-0.5, 1.1]),
+        legend=dict(orientation='h', yanchor='bottom', y=1.0, xanchor='left', x=0),
+        plot_bgcolor='rgba(250,250,250,1)',
+    )
+    st.plotly_chart(fig, use_container_width=True, key="route_schematic")
+
+    km = float(selected_path.get('length_km', 0) or 0)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("ROADM hops", selected_path.get('hops', 0))
+    c2.metric("Fiber spans", selected_path.get('n_spans', 0))
+    c3.metric("Total length", f"{km:.0f} km")
+    c4.metric("Amplifiers", selected_path.get('n_amps', 0))
+    st.caption(f"Estimated one-way latency ≈ {km * 4.9:.2f} µs ({km * 4.9e-3:.2f} ms)  ·  "
+               + "Route: " + " → ".join(s['label'] for s in stations))
+
+
+def render_single_path_analysis(equipment, network, topology_json, source, destination,
+                                route_nodes_list, route_loose_list):
+    """Stage 2 — focused single-path analysis on a locked route. Renders the transceiver/channel
+    controls and the Run Transmission / Optimize Launch Power actions, all pinned to the chosen
+    route (route_nodes_list = the ordered ROADM sequence of the selected path)."""
+    st.subheader("Simulation Configuration")
+
+    trx_opts = transceiver_types(equipment)
+    topo_trx = get_topology_transceiver_types(topology_json)
+    src_variety = topo_trx.get(source)
+    dst_variety = topo_trx.get(destination)
+
+    def _endpoint_selectors(role, uid, variety, prefix):
+        """Render type(override)+mode selectors for one endpoint, auto-populating the type from
+        the node's topology type_variety. Returns (trx_type, trx_mode|None=Auto)."""
+        if not uid:
+            st.markdown(f"**{role}** — _select a node_")
+            return None, None
+        name = remove_type_from_nodeUid(str(uid))
+        if variety:
+            tag = f"`{variety}`" + ("" if variety in trx_opts else " ⚠️ not in equipment library")
+        else:
+            tag = "_not specified in topology_"
+        st.markdown(f"**{role}** — {name}: {tag}")
+
+        if not trx_opts:
+            st.warning("No transceivers found in the equipment library.")
+            return None, None
+
+        type_key, mode_key = f'{prefix}_trx_type_select', f'{prefix}_trx_mode_select'
+        autopop_key = f'_{prefix}_autopop'
+        fallback_type = 'Voyager' if 'Voyager' in trx_opts else trx_opts[0]
+        if st.session_state.get(autopop_key) != uid:
+            st.session_state[autopop_key] = uid
+            if variety and variety in trx_opts:
+                st.session_state[type_key] = variety
+        if st.session_state.get(type_key) not in trx_opts:
+            st.session_state[type_key] = fallback_type
+
+        c1, c2 = st.columns(2)
+        with c1:
+            t = st.selectbox(f"{role} type (override)", options=trx_opts, key=type_key,
+                             help="Defaults to the node's topology type_variety; "
+                                  "change it to test a different transceiver.")
+        with c2:
+            m_opts = [AUTO_MODE_LABEL] + transceiver_modes(equipment, t)
+            if st.session_state.get(mode_key) not in m_opts:
+                st.session_state[mode_key] = AUTO_MODE_LABEL
+            m_label = st.selectbox(f"{role} mode", options=m_opts, key=mode_key,
+                                   help="'Auto' picks the best feasible mode.")
+        return t, (None if m_label == AUTO_MODE_LABEL else m_label)
+
+    src_trx_type, src_trx_mode = _endpoint_selectors("Source trx", source, src_variety, 'src')
+    dst_trx_type, dst_trx_mode = _endpoint_selectors("Destination trx", destination, dst_variety, 'dst')
+    st.caption("The source type+mode defines the transmitted channel (drives propagation); "
+               "the destination mode sets the required-OSNR threshold for the feasibility verdict.")
+
+    col_c, col_d = st.columns(2)
+    with col_c:
+        launch_power = st.slider("Launch Power (dBm)", -5, 5, 0)
+    with col_d:
+        bidir = st.checkbox("Bidirectional", value=False)
+
+    si = equipment['SI']['default']
+
+    def _si_default(attr, fallback, scale=1.0):
+        v = getattr(si, attr, None)
+        try:
+            return float(v) * scale if v is not None else fallback
+        except (TypeError, ValueError):
+            return fallback
+
+    if 'sim_margin' not in st.session_state:
+        st.session_state.sim_margin = _si_default('sys_margins', 0.0)
+    if 'sim_spacing' not in st.session_state:
+        st.session_state.sim_spacing = _si_default('spacing', 50.0, 1e-9)
+    if 'sim_pwr_start' not in st.session_state:
+        st.session_state.sim_pwr_start = -2.0
+    if 'sim_pwr_stop' not in st.session_state:
+        st.session_state.sim_pwr_stop = 4.0
+    if 'sim_pwr_step' not in st.session_state:
+        st.session_state.sim_pwr_step = 0.5
+
+    with st.expander("📡 Channel & System Parameters"):
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            st.session_state.sim_spacing = st.number_input(
+                "Channel spacing [GHz]", value=float(st.session_state.sim_spacing), step=0.01,
+                key='spec_spacing', help="Should be ≥ the selected mode's minimum spacing.")
+        with col_s2:
+            st.session_state.sim_margin = st.number_input(
+                "System margin [dB]", value=float(st.session_state.sim_margin), step=0.1, key='trx_margin')
+        st.caption("Baud rate, roll-off, Tx OSNR, required OSNR and the frequency band are taken "
+                   "from the selected transceiver mode.")
+
+    with st.expander("⚡ Reference Power and Sweep"):
+        col_p1, col_p2, col_p3 = st.columns(3)
+        with col_p1:
+            st.session_state.sim_pwr_start = st.number_input(
+                "Start [dBm]", value=float(st.session_state.sim_pwr_start), step=0.1, key='pwr_start')
+        with col_p2:
+            st.session_state.sim_pwr_stop = st.number_input(
+                "Stop [dBm]", value=float(st.session_state.sim_pwr_stop) if st.session_state.sim_pwr_stop is not None else 4.0,
+                step=0.1, key='pwr_stop')
+        with col_p3:
+            st.session_state.sim_pwr_step = st.number_input(
+                "Step [dBm]", value=float(st.session_state.sim_pwr_step) if st.session_state.sim_pwr_step is not None else 0.1,
+                step=0.01, key='pwr_step')
+
+    st.subheader("🧾 Simulation inputs to be used")
+    render_sim_inputs_preview(equipment, source, destination, route_nodes_list, route_loose_list,
+                              launch_power, src_trx_type, src_trx_mode, dst_trx_type, dst_trx_mode, bidir)
+    st.caption("The transmit channel comes from the source transceiver mode; the receive side shows "
+               "the feasibility threshold. The equipment SI library defaults are unchanged.")
+
+    if st.button("🚀 Run Transmission", type="primary", on_click=run_transmission,
+                 args=(equipment, network, source, destination, launch_power,
+                       src_trx_type, src_trx_mode, dst_trx_type, dst_trx_mode, bidir,
+                       st.session_state.sim_margin, st.session_state.sim_spacing,
+                       st.session_state.sim_pwr_start, st.session_state.sim_pwr_stop, st.session_state.sim_pwr_step,
+                       route_nodes_list, route_loose_list)):
+        pass  # Callback handles everything
+
+    st.caption("Optimization sweeps span input power from Start to Stop (Step) in the "
+               "'⚡ Reference Power and Sweep' expander and picks the GSNR-maximising power.")
+    if st.button("⚡ Optimize Launch Power", type="secondary", on_click=run_power_optimization,
+                 args=(equipment, network, source, destination, launch_power,
+                       src_trx_type, src_trx_mode, dst_trx_type, dst_trx_mode, bidir,
+                       st.session_state.sim_margin, st.session_state.sim_spacing,
+                       st.session_state.sim_pwr_start, st.session_state.sim_pwr_stop, st.session_state.sim_pwr_step,
+                       route_nodes_list, route_loose_list)):
+        pass  # Callback handles everything
+
+
 def render_batch_rsa(result):
     """Render batch RSA results: blocking probability, provisioned capacity, blocking-vs-load and
     capacity-vs-load curves, per-link spectral utilization, and a per-request outcome table."""
@@ -1997,6 +2298,22 @@ with tab3:
                         name='Path Nodes'
                     ))
             
+            col_a, col_b, col_c = st.columns(3)
+            edge_pairs = {
+                (edge.get("source"), edge.get("target"))
+                for edge in edges_data
+                if edge.get("source") and edge.get("target")
+            }
+            is_directed = True
+            if edge_pairs:
+                is_directed = any((b, a) not in edge_pairs for (a, b) in edge_pairs)
+            with col_a:
+                st.metric("Total Nodes", len(nodes_data))
+            with col_b:
+                st.metric("Total Edges", len(edges_data))
+            with col_c:
+                st.metric("Is Directed", "Yes" if is_directed else "No")
+            
             # Update layout
             if use_map:
                 # Calculate center coordinates for better initial view
@@ -2083,24 +2400,18 @@ with tab3:
                                 st.session_state.destination_node = selected_uid
                                 st.session_state.dest_select = selected_uid
 
-            # Network statistics
-            st.subheader("📈 Network Statistics")
-            col_a, col_b, col_c = st.columns(3)
-            edge_pairs = {
-                (edge.get("source"), edge.get("target"))
-                for edge in edges_data
-                if edge.get("source") and edge.get("target")
-            }
-            is_directed = True
-            if edge_pairs:
-                is_directed = any((b, a) not in edge_pairs for (a, b) in edge_pairs)
-            with col_a:
-                st.metric("Total Nodes", len(nodes_data))
-            with col_b:
-                st.metric("Total Edges", len(edges_data))
-            with col_c:
-                st.metric("Is Directed", "Yes" if is_directed else "No")
-            
+            # Selected route schematic + single-path analysis (Stage 2 — moved here from col2)
+            _sel = st.session_state.get('selected_path')
+            _src = st.session_state.get('source_node')
+            _dst = st.session_state.get('destination_node')
+            if _sel and _sel.get('source') == _src and _sel.get('destination') == _dst:
+                st.divider()
+                st.subheader("🔍 Selected Route")
+                render_route_schematic(_sel)
+                st.subheader("🔬 Single-Path Analysis")
+                render_single_path_analysis(equipment, network, topology_json, _src, _dst,
+                                            _sel['nodes_list'], _sel['loose_list'])
+
             # Display simulation results if available
             if st.session_state.simulation_results is not None:
                 results = st.session_state.simulation_results
@@ -2264,211 +2575,107 @@ with tab3:
                         )
                         st.session_state.destination_node = destination_node if destination_node else None
 
-                    st.subheader("Path Constraints")
-                    nodes_list = st.multiselect(
-                        "nodes_list:",
-                        options=nodes,
-                        default=st.session_state.get("constraint_nodes_list", []),
-                        key="constraint_nodes_list",
-                        help="Ordered list of nodes that the path should traverse."
-                    )
-
-                    loose_list = []
-                    if nodes_list:
-                        st.markdown("loose_list:")
-                        for constrained_node in nodes_list:
-                            loose_key = f"constraint_type_{str(constrained_node).replace(' ', '_')}"
-                            hop_type = st.selectbox(
-                                f"{constrained_node} hop type",
-                                options=["LOOSE", "STRICT"],
-                                index=0,
-                                key=loose_key,
-                                help="STRICT enforces this hop; LOOSE allows alternate optimization."
-                            )
-                            loose_list.append(hop_type)
-
                     source = st.session_state.source_node
                     destination = st.session_state.destination_node
 
                     if source and destination and source == destination:
                         st.warning("Source and destination must be different nodes.")
 
-                    # Basic simulation settings
-                    st.subheader("Simulation Configuration")
+                    # ===================== Stage 1: Route (find & lock a path) =====================
+                    st.subheader("🧭 Route")
+                    with st.expander("Path constraints (optional)"):
+                        nodes_list = st.multiselect(
+                            "Include nodes (ordered):", options=nodes,
+                            default=st.session_state.get("constraint_nodes_list", []),
+                            key="constraint_nodes_list",
+                            help="Candidate routes are filtered to pass through these nodes, in order.")
+                    loose_list = ['STRICT'] * len(nodes_list)
 
-                    trx_opts = transceiver_types(equipment)
+                    route_signature = (source, destination, tuple(nodes_list))
+                    # Invalidate locked candidates if the source/destination/constraints changed.
+                    if st.session_state.route_signature != route_signature:
+                        st.session_state.path_candidates = None
+                        st.session_state.selected_path = None
+                        st.session_state.route_signature = route_signature
 
-                    # Transceiver type_variety declared in the topology for each endpoint.
-                    topo_trx = get_topology_transceiver_types(topology_json)
-                    src_variety = topo_trx.get(source)
-                    dst_variety = topo_trx.get(destination)
-
-                    def _endpoint_selectors(role, uid, variety, prefix):
-                        """Render type(override)+mode selectors for one endpoint, auto-populating the type
-                        from the node's topology type_variety. Returns (trx_type, trx_mode|None=Auto)."""
-                        if not uid:
-                            st.markdown(f"**{role}** — _select a node_")
-                            return None, None
-                        name = remove_type_from_nodeUid(str(uid))
-                        if variety:
-                            tag = f"`{variety}`" + ("" if variety in trx_opts else " ⚠️ not in equipment library")
+                    def _lock_selected_route():
+                        """Set the selected path + map highlight from the current radio choice.
+                        Runs as a widget callback (before the page re-renders) so the topology map,
+                        which is drawn earlier in the script, shows the freshly selected route."""
+                        cands = st.session_state.get('path_candidates') or []
+                        idx = st.session_state.get('route_choice', 0) or 0
+                        if cands and 0 <= idx < len(cands):
+                            c = cands[idx]
+                            st.session_state.selected_path = {
+                                'source': st.session_state.source_node,
+                                'destination': st.session_state.destination_node,
+                                'nodes_list': list(c['roadm_sequence']),
+                                'loose_list': ['STRICT'] * len(c['roadm_sequence']),
+                                'element_uids': c['element_uids'],
+                                'hops': c['hops'], 'n_spans': c['n_spans'],
+                                'n_amps': c.get('n_amps', 0), 'length_km': c['length_km'],
+                                'stations': c.get('stations', []), 'segments': c.get('segments', []),
+                            }
+                            st.session_state.highlighted_path = c['element_uids']
                         else:
-                            tag = "_not specified in topology_"
-                        st.markdown(f"**{role}** — {name}: {tag}")
+                            st.session_state.selected_path = None
 
-                        if not trx_opts:
-                            st.warning("No transceivers found in the equipment library.")
-                            return None, None
-
-                        type_key, mode_key = f'{prefix}_trx_type_select', f'{prefix}_trx_mode_select'
-                        autopop_key = f'_{prefix}_autopop'
-                        fallback_type = 'Voyager' if 'Voyager' in trx_opts else trx_opts[0]
-                        # Auto-populate the type from the node's topology type_variety when the node changes.
-                        if st.session_state.get(autopop_key) != uid:
-                            st.session_state[autopop_key] = uid
-                            if variety and variety in trx_opts:
-                                st.session_state[type_key] = variety
-                        if st.session_state.get(type_key) not in trx_opts:
-                            st.session_state[type_key] = fallback_type
-
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            t = st.selectbox(f"{role} type (override)", options=trx_opts, key=type_key,
-                                             help="Defaults to the node's topology type_variety; "
-                                                  "change it to test a different transceiver.")
-                        with c2:
-                            m_opts = [AUTO_MODE_LABEL] + transceiver_modes(equipment, t)
-                            if st.session_state.get(mode_key) not in m_opts:
-                                st.session_state[mode_key] = AUTO_MODE_LABEL
-                            m_label = st.selectbox(f"{role} mode", options=m_opts, key=mode_key,
-                                                   help="'Auto' picks the best feasible mode.")
-                        return t, (None if m_label == AUTO_MODE_LABEL else m_label)
-
-                    src_trx_type, src_trx_mode = _endpoint_selectors("Source trx", source, src_variety, 'src')
-                    dst_trx_type, dst_trx_mode = _endpoint_selectors("Destination trx", destination, dst_variety, 'dst')
-                    st.caption("The source type+mode defines the transmitted channel (drives propagation); "
-                               "the destination mode sets the required-OSNR threshold for the feasibility verdict.")
-
-                    col_c, col_d = st.columns(2)
-                    with col_c:
-                        launch_power = st.slider("Launch Power (dBm)", -5, 5, 0)
-                    with col_d:
-                        bidir = st.checkbox("Bidirectional", value=False)
-
-                    si = equipment['SI']['default']
-
-                    def _si_default(attr, fallback, scale=1.0):
-                        """Read an SI reference attribute (Hz/dB) and convert to display units."""
-                        v = getattr(si, attr, None)
+                    def _compute_routes():
+                        """Compute candidate routes (button callback) and lock the first one."""
+                        src_ = st.session_state.source_node
+                        dst_ = st.session_state.destination_node
+                        nl_ = list(st.session_state.get('constraint_nodes_list', []))
+                        ll_ = ['STRICT'] * len(nl_)
+                        k_ = int(st.session_state.get('k_routes', 3))
+                        topo_uids_ = {el.get('uid') for el in topology_json.get('elements', [])
+                                      if isinstance(el, dict)}
                         try:
-                            return float(v) * scale if v is not None else fallback
-                        except (TypeError, ValueError):
-                            return fallback
+                            st.session_state.path_candidates = compute_candidate_paths(
+                                equipment, network, src_, dst_, nl_, ll_, k=k_, topology_uids=topo_uids_)
+                            st.session_state.route_error = None
+                        except Exception as e:
+                            st.session_state.path_candidates = []
+                            st.session_state.route_error = str(e)
+                        st.session_state.route_signature = (src_, dst_, tuple(nl_))
+                        st.session_state.route_choice = 0
+                        _lock_selected_route()
 
-                    # Only spacing, system margin and the sweep are user inputs; the rest of the channel
-                    # (baud rate, roll-off, Tx OSNR, required OSNR, band) comes from the transceiver mode.
-                    if 'sim_margin' not in st.session_state:
-                        st.session_state.sim_margin = _si_default('sys_margins', 0.0)
-                    if 'sim_spacing' not in st.session_state:
-                        st.session_state.sim_spacing = _si_default('spacing', 50.0, 1e-9)
-                    if 'sim_pwr_start' not in st.session_state:
-                        st.session_state.sim_pwr_start = -2.0
-                    if 'sim_pwr_stop' not in st.session_state:
-                        st.session_state.sim_pwr_stop = 4.0
-                    if 'sim_pwr_step' not in st.session_state:
-                        st.session_state.sim_pwr_step = 0.5
+                    rcol1, rcol2 = st.columns([1, 2])
+                    with rcol1:
+                        st.number_input("Alternate routes (k)", min_value=1, max_value=10,
+                                        value=3, step=1, key='k_routes')
+                    with rcol2:
+                        st.write("")
+                        st.button("🧭 Compute / lock path", type="primary",
+                                  disabled=not (source and destination and source != destination),
+                                  on_click=_compute_routes)
 
-                    # Channel & System Parameters (the only directly editable physical inputs)
-                    with st.expander("📡 Channel & System Parameters"):
-                        col_s1, col_s2 = st.columns(2)
-                        with col_s1:
-                            st.session_state.sim_spacing = st.number_input(
-                                "Channel spacing [GHz]",
-                                value=float(st.session_state.sim_spacing),
-                                step=0.01,
-                                key='spec_spacing',
-                                help="Should be ≥ the selected mode's minimum spacing."
-                            )
-                        with col_s2:
-                            st.session_state.sim_margin = st.number_input(
-                                "System margin [dB]",
-                                value=float(st.session_state.sim_margin),
-                                step=0.1,
-                                key='trx_margin'
-                            )
-                        st.caption("Baud rate, roll-off, Tx OSNR, required OSNR and the frequency band are "
-                                   "taken from the selected transceiver mode.")
+                    if st.session_state.get('route_error'):
+                        st.error(f"Routing failed: {st.session_state.route_error}")
 
-                    # Reference Power and Sweep
-                    with st.expander("⚡ Reference Power and Sweep"):
-                        col_p1, col_p2, col_p3 = st.columns(3)
-                        with col_p1:
-                            st.session_state.sim_pwr_start = st.number_input(
-                                "Start [dBm]",
-                                value=float(st.session_state.sim_pwr_start),
-                                step=0.1,
-                                key='pwr_start'
-                            )
-                        with col_p2:
-                            st.session_state.sim_pwr_stop = st.number_input(
-                                "Stop [dBm]",
-                                value=float(st.session_state.sim_pwr_stop) if st.session_state.sim_pwr_stop is not None else 4.0,
-                                step=0.1,
-                                key='pwr_stop'
-                            )
-                        with col_p3:
-                            st.session_state.sim_pwr_step = st.number_input(
-                                "Step [dBm]",
-                                value=float(st.session_state.sim_pwr_step) if st.session_state.sim_pwr_step is not None else 0.1,
-                                step=0.01,
-                                key='pwr_step'
-                            )
-
-                    can_run_simulation = bool(source and destination and source != destination)
-
-                    if can_run_simulation:
-                        st.subheader("🧾 Simulation inputs to be used")
-                        render_sim_inputs_preview(equipment, source, destination, nodes_list, loose_list,
-                                                  launch_power, src_trx_type, src_trx_mode,
-                                                  dst_trx_type, dst_trx_mode, bidir)
-                        st.caption(
-                            "The transmit channel comes from the selected transceiver mode; the receive side "
-                            "shows the feasibility threshold. The equipment SI library defaults are unchanged."
-                        )
-
-                    if st.button(
-                        "🚀 Run Transmission",
-                        type="primary",
-                        disabled=not can_run_simulation,
-                        on_click=run_transmission,
-                        args=(
-                            equipment, network, source, destination, launch_power,
-                            src_trx_type, src_trx_mode, dst_trx_type, dst_trx_mode, bidir,
-                            st.session_state.sim_margin, st.session_state.sim_spacing,
-                            st.session_state.sim_pwr_start, st.session_state.sim_pwr_stop, st.session_state.sim_pwr_step,
-                            nodes_list, loose_list,
-                        )
-                    ):
-                        pass  # Callback handles everything
-
-                    st.caption(
-                        "Optimization sweeps span input power from Start to Stop (Step) in the "
-                        "'⚡ Reference Power and Sweep' expander and picks the GSNR-maximising power."
-                    )
-                    if st.button(
-                        "⚡ Optimize Launch Power",
-                        type="secondary",
-                        disabled=not can_run_simulation,
-                        on_click=run_power_optimization,
-                        args=(
-                            equipment, network, source, destination, launch_power,
-                            src_trx_type, src_trx_mode, dst_trx_type, dst_trx_mode, bidir,
-                            st.session_state.sim_margin, st.session_state.sim_spacing,
-                            st.session_state.sim_pwr_start, st.session_state.sim_pwr_stop, st.session_state.sim_pwr_step,
-                            nodes_list, loose_list,
-                        )
-                    ):
-                        pass  # Callback handles everything
+                    candidates = st.session_state.get('path_candidates')
+                    if candidates:
+                        def _fmt_route(i):
+                            c = candidates[i]
+                            return f"Route {c['index'] + 1}: {c['hops']} ROADMs · {c['n_spans']} spans · {c['length_km']:.0f} km"
+                        # Keep the stored choice valid for the current candidate set.
+                        if st.session_state.get('route_choice', 0) >= len(candidates):
+                            st.session_state.route_choice = 0
+                        st.radio("Select a route", options=list(range(len(candidates))),
+                                 format_func=_fmt_route, key='route_choice', on_change=_lock_selected_route)
+                        sel = st.session_state.get('selected_path')
+                        if sel:
+                            st.success(f"Locked route: {sel['hops']} ROADMs · {sel['n_spans']} spans · "
+                                       f"{sel['length_km']:.0f} km")
+                            st.caption("ROADM sequence: " + " → ".join(
+                                remove_type_from_nodeUid(r) for r in sel['nodes_list']))
+                    elif candidates is not None:
+                        st.warning("No route found for this source/destination (and constraints).")
+                    elif source and destination and source != destination:
+                        st.info("Click **Compute / lock path** to find candidate routes.")
+                    if st.session_state.get('selected_path'):
+                        st.caption("➡️ Route schematic and single-path analysis are shown under the "
+                                   "network map on the left.")
 
                 with wf_batch:
                     st.subheader("📦 Batch RSA / Blocking")

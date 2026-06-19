@@ -9,12 +9,21 @@ Tabs:
 4. Services Generator - Create path requests with validation that src/dst exist in topology
 """
 
+import importlib
 import json
 from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
 import streamlit as st
+
+import gnpy_schema as schema
+
+# Streamlit keeps imported submodules cached in sys.modules across reruns and
+# does not always re-import them when the file changes in a long-running
+# session. Force a reload so the app never runs against a stale schema. The
+# module is tiny (pure functions/constants), so the cost is negligible.
+importlib.reload(schema)
 
 # =============================================================================
 # Configuration
@@ -28,6 +37,7 @@ PROJECTS_DIR = BASE_DIR / "inputs" / "projects"
 LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
 (LIBRARY_DIR / "amplifiers").mkdir(exist_ok=True)
 (LIBRARY_DIR / "fibers").mkdir(exist_ok=True)
+(LIBRARY_DIR / "raman_fibers").mkdir(exist_ok=True)
 (LIBRARY_DIR / "transceivers").mkdir(exist_ok=True)
 (LIBRARY_DIR / "roadms").mkdir(exist_ok=True)
 (LIBRARY_DIR / "simulation_params").mkdir(exist_ok=True)
@@ -75,35 +85,192 @@ def delete_json_file(filepath: Path) -> bool:
         return False
 
 
+def unwrap_component(data: Optional[dict]) -> dict:
+    """Return the GNPy-native (flat) component dict.
+
+    Some legacy files wrap the payload as ``{"uid": ..., "params": {...}}``.
+    The canonical on-disk shape is flat, so unwrap when needed.
+    """
+    if isinstance(data, dict) and isinstance(data.get("params"), dict) and "type_variety" in data["params"]:
+        return data["params"]
+    return data or {}
+
+
+def _strict_transceiver(data: dict) -> dict:
+    """Normalize a transceiver to the strict GNPy schema (drops vendor extras)."""
+    data = unwrap_component(data)
+    modes = []
+    for m in data.get("mode", []):
+        modes.append(schema.build_transceiver_mode(m, m.get("penalties")))
+    freq = data.get("frequency", {})
+    return schema.build_transceiver(
+        data.get("type_variety", ""),
+        freq.get("min", schema.DEFAULT_F_MIN_HZ),
+        freq.get("max", schema.DEFAULT_F_MAX_HZ),
+        modes,
+    )
+
+
+def list_amplifier_varieties(folder: Path, exclude: Optional[str] = None) -> list[str]:
+    """Collect the type_variety names of all amplifiers in a folder."""
+    out: list[str] = []
+    for name in list_json_files(folder):
+        if exclude and name == exclude:
+            continue
+        data = unwrap_component(load_json_file(folder / f"{name}.json"))
+        tv = str(data.get("type_variety", "")).strip()
+        if tv:
+            out.append(tv)
+    return sorted(set(out))
+
+
+# =============================================================================
+# Generic schema-driven form renderer
+# =============================================================================
+def _parse_float_list(text: str) -> list[float]:
+    out: list[float] = []
+    for part in str(text).replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(float(part))
+        except ValueError:
+            pass
+    return out
+
+
+def render_schema_fields(
+    specs: list[dict],
+    values: dict,
+    key_prefix: str,
+    ref_options: Optional[list[str]] = None,
+) -> dict:
+    """Render Streamlit widgets from field specs and return collected values.
+
+    Fields tagged with ``optional_group`` are tucked into expanders so the
+    common path stays clean. ``ref_options`` populates reference selectors.
+    """
+    ref_options = ref_options or []
+    result: dict[str, Any] = {}
+
+    def render_one(spec: dict) -> None:
+        key = spec["key"]
+        wkey = f"{key_prefix}_{key}"
+        cur = values.get(key, spec["default"])
+        ftype = spec["type"]
+        label = spec["label"]
+        help_ = spec.get("help") or None
+
+        if ftype == schema.TEXT:
+            result[key] = st.text_input(label, value=str(cur or ""), help=help_, key=wkey)
+        elif ftype == schema.BOOL:
+            result[key] = st.checkbox(label, value=bool(cur), help=help_, key=wkey)
+        elif ftype == schema.INT:
+            try:
+                ival = int(cur)
+            except (TypeError, ValueError):
+                ival = 0
+            result[key] = int(st.number_input(label, value=ival, step=1, help=help_, key=wkey))
+        elif ftype in (schema.FLOAT, schema.FLOAT_SCI):
+            try:
+                fval = float(cur)
+            except (TypeError, ValueError):
+                fval = 0.0
+            result[key] = st.number_input(label, value=fval, format=spec.get("format"), help=help_, key=wkey)
+        elif ftype == schema.SELECT:
+            opts = spec.get("options", [])
+            idx = opts.index(cur) if cur in opts else 0
+            result[key] = st.selectbox(label, options=opts, index=idx, help=help_, key=wkey)
+        elif ftype == schema.LIST_FLOAT:
+            cur_text = ", ".join(str(x) for x in (cur or []))
+            txt = st.text_input(label, value=cur_text, help=help_, key=wkey)
+            result[key] = _parse_float_list(txt)
+        elif ftype == schema.REF_SELECT:
+            opts = [""] + [o for o in ref_options if o]
+            idx = opts.index(cur) if cur in opts else 0
+            result[key] = st.selectbox(label, options=opts, index=idx, help=help_, key=wkey)
+        elif ftype == schema.REF_MULTISELECT:
+            default = [c for c in (cur or []) if c in ref_options]
+            result[key] = st.multiselect(label, options=ref_options, default=default, help=help_, key=wkey)
+        else:
+            result[key] = st.text_input(label, value=str(cur or ""), help=help_, key=wkey)
+
+    main = [s for s in specs if not s.get("optional_group")]
+    groups: dict[str, list[dict]] = {}
+    for s in specs:
+        g = s.get("optional_group")
+        if g:
+            groups.setdefault(g, []).append(s)
+
+    for i in range(0, len(main), 2):
+        cols = st.columns(2)
+        for col, spec in zip(cols, main[i:i + 2]):
+            with col:
+                render_one(spec)
+
+    for gname, gspecs in groups.items():
+        with st.expander(gname, expanded=False):
+            for i in range(0, len(gspecs), 2):
+                cols = st.columns(2)
+                for col, spec in zip(cols, gspecs[i:i + 2]):
+                    with col:
+                        render_one(spec)
+
+    return result
+
+
+_PENALTY_IMPAIRMENTS = ["chromatic_dispersion", "pmd", "pdl"]
+
+
+def _render_penalties_editor(penalties: list, key_prefix: str) -> list:
+    """Edit a transceiver mode's penalty list and return the GNPy-shaped list.
+
+    Each GNPy penalty is a dict with one impairment key plus ``penalty_value``,
+    e.g. ``{"chromatic_dispersion": 360000, "penalty_value": 0.5}``.
+    """
+    rows = []
+    for p in penalties or []:
+        imp = next((k for k in _PENALTY_IMPAIRMENTS if k in p), "chromatic_dispersion")
+        rows.append({"impairment": imp, "value": p.get(imp, 0.0), "penalty_value": p.get("penalty_value", 0.0)})
+    if not rows:
+        rows = [{"impairment": "chromatic_dispersion", "value": 0.0, "penalty_value": 0.0}]
+
+    with st.expander("Penalties (optional)", expanded=False):
+        edited = st.data_editor(
+            pd.DataFrame(rows),
+            num_rows="dynamic",
+            use_container_width=True,
+            key=f"{key_prefix}_editor",
+            column_config={
+                "impairment": st.column_config.SelectboxColumn("Impairment", options=_PENALTY_IMPAIRMENTS),
+                "value": st.column_config.NumberColumn("Value (ps/nm | ps | dB)"),
+                "penalty_value": st.column_config.NumberColumn("Penalty (dB)"),
+            },
+        )
+
+    out = []
+    for _, r in edited.iterrows():
+        imp = str(r.get("impairment", "")).strip()
+        if imp not in _PENALTY_IMPAIRMENTS:
+            continue
+        val = r.get("value")
+        pen = r.get("penalty_value")
+        if pd.isna(val) and pd.isna(pen):
+            continue
+        out.append({imp: float(val or 0.0), "penalty_value": float(pen or 0.0)})
+    return out
+
+
 # =============================================================================
 # Component Library Functions
 # =============================================================================
 def get_default_amplifier() -> dict:
-    return {
-        "type_variety": "",
-        "type_def": "variable_gain",
-        "gain_flatmax": 26.0,
-        "gain_min": 15.0,
-        "p_max": 23.0,
-        "nf_min": 5.0,
-        "nf_max": 7.0,
-        "nf0": 6.0,  # For fixed_gain type
-        "out_voa_auto": False,
-        "allowed_for_design": True,
-        "f_min": 191.275e12,  # Optional: min frequency (Hz)
-        "f_max": 196.125e12,  # Optional: max frequency (Hz)
-    }
+    return schema.default_edfa("variable_gain")
 
 
 def get_default_fiber() -> dict:
-    return {
-        "type_variety": "",
-        "dispersion": 1.67e-05,  # s/m² (D coefficient)
-        "dispersion_slope": 0.0,  # Optional: s/m³ (S coefficient)
-        "effective_area": 83e-12,  # m²
-        "gamma": 0.0,  # Optional: nonlinear coefficient (1/W/m), derived from effective_area if 0
-        "pmd_coef": 1.265e-15,  # s/√m
-    }
+    return schema.default_fiber("scalar")
 
 
 def get_default_transceiver() -> dict:
@@ -115,51 +282,15 @@ def get_default_transceiver() -> dict:
 
 
 def get_default_transceiver_mode() -> dict:
-    return {
-        "format": "mode 1",
-        "baud_rate": 32e9,
-        "OSNR": 12.0,  # Min required OSNR in 0.1nm (dB)
-        "bit_rate": 100e9,
-        "roll_off": 0.15,
-        "tx_osnr": 40.0,
-        "min_spacing": 50e9,
-        "cost": 1.0,
-        "equalization_offset_db": 0.0,  # Optional: deviation from per-channel equalization target
-        "penalties": [],  # Optional: list of impairment penalties [{"chromatic_dispersion": 360000, "penalty_value": 0.5}]
-    }
+    return schema.default_transceiver_mode()
 
 
 def get_default_roadm() -> dict:
-    return {
-        "type_variety": "default",
-        # Equalization target (use ONE of the following three):
-        "target_pch_out_db": -20.0,  # Per-channel power target (dBm)
-        # "target_psd_out_mWperGHz": None,  # Alternative: PSD target (mW/GHz)
-        # "target_out_mWperSlotWidth": None,  # Alternative: PSW target (mW per slot width)
-        "add_drop_osnr": 38.0,  # OSNR contribution from add/drop ports (dB)
-        "pmd": 0.0,  # Polarization mode dispersion (s)
-        "pdl": 0.0,  # Polarization dependent loss (dB)
-        "restrictions": {
-            "preamp_variety_list": [],
-            "booster_variety_list": []
-        }
-    }
+    return schema.default_roadm("target_pch_out_db")
 
 
 def get_default_si_params() -> dict:
-    return {
-        "type_variety": "default",  # Optional: unique name for multiband identification
-        "f_min": 191.3e12,  # Hz - spectrum lower bound
-        "f_max": 196.1e12,  # Hz - spectrum upper bound
-        "baud_rate": 32e9,  # Hz
-        "spacing": 50e9,  # Hz - carrier spacing
-        "power_dbm": 0.0,  # dBm - target input power in spans
-        "power_range_db": [0, 0, 1],  # [min, max, step] power sweep excursion
-        "tx_power_dbm": 0.0,  # dBm - power out from transceiver (optional, defaults to power_dbm)
-        "roll_off": 0.15,  # TX signal roll-off shape (0-1)
-        "tx_osnr": 40.0,  # dB - OSNR out from transponder
-        "sys_margins": 2.0,  # dB - added margin on min required transceiver OSNR
-    }
+    return schema.default_si()
 
 
 def get_default_span() -> dict:
@@ -210,11 +341,15 @@ def render_component_library():
 
 def render_amplifier_library():
     st.subheader("EDFA Library")
+    st.caption(
+        "Fields adapt to the selected `type_def` (GNPy noise/gain model). "
+        "Only parameters valid for that model are shown and saved."
+    )
     folder = LIBRARY_DIR / "amplifiers"
     existing = list_json_files(folder)
 
     col1, col2 = st.columns([1, 2])
-    
+
     with col1:
         st.markdown("**Saved Amplifiers**")
         if existing:
@@ -222,8 +357,9 @@ def render_amplifier_library():
                 c1, c2 = st.columns([3, 1])
                 with c1:
                     if st.button(f"📄 {name}", key=f"load_amp_{name}", use_container_width=True):
-                        st.session_state.lib_amp_data = load_json_file(folder / f"{name}.json")
+                        st.session_state.lib_amp_data = unwrap_component(load_json_file(folder / f"{name}.json"))
                         st.session_state.lib_amp_name = name
+                        st.rerun()
                 with c2:
                     if st.button("🗑️", key=f"del_amp_{name}"):
                         delete_json_file(folder / f"{name}.json")
@@ -233,8 +369,7 @@ def render_amplifier_library():
 
     with col2:
         st.markdown("**Editor**")
-        
-        # Initialize from session state or default
+
         if "lib_amp_data" not in st.session_state:
             st.session_state.lib_amp_data = get_default_amplifier()
         if "lib_amp_name" not in st.session_state:
@@ -243,48 +378,41 @@ def render_amplifier_library():
         amp = st.session_state.lib_amp_data
 
         name = st.text_input("Name (filename)", value=st.session_state.lib_amp_name, key="amp_name_input")
-        
-        c1, c2 = st.columns(2)
-        with c1:
-            type_variety = st.text_input("type_variety *", value=amp.get("type_variety", ""), key="amp_variety")
-            gain_flatmax = st.number_input("gain_flatmax (dB)", value=float(amp.get("gain_flatmax", 26.0)), key="amp_gain_flatmax")
-            p_max = st.number_input("p_max (dBm)", value=float(amp.get("p_max", 23.0)), key="amp_p_max")
-            nf_min = st.number_input("nf_min (dB)", value=float(amp.get("nf_min", 5.0)), key="amp_nf_min")
-            f_min = st.number_input("f_min (Hz) [optional]", value=float(amp.get("f_min", 191.275e12)), format="%.2e", key="amp_f_min")
-        with c2:
-            type_def = st.selectbox("type_def", ["variable_gain", "fixed_gain", "openroadm", "openroadm_preamp", "openroadm_booster", "advanced_model", "dual_stage", "multi_band"], 
-                                   index=["variable_gain", "fixed_gain", "openroadm", "openroadm_preamp", "openroadm_booster", "advanced_model", "dual_stage", "multi_band"].index(amp.get("type_def", "variable_gain")) if amp.get("type_def", "variable_gain") in ["variable_gain", "fixed_gain", "openroadm", "openroadm_preamp", "openroadm_booster", "advanced_model", "dual_stage", "multi_band"] else 0,
-                                   key="amp_type_def")
-            gain_min = st.number_input("gain_min (dB)", value=float(amp.get("gain_min", 15.0)), key="amp_gain_min")
-            out_voa_auto = st.checkbox("out_voa_auto", value=amp.get("out_voa_auto", False), key="amp_out_voa")
-            nf_max = st.number_input("nf_max (dB)", value=float(amp.get("nf_max", 7.0)), key="amp_nf_max")
-            f_max = st.number_input("f_max (Hz) [optional]", value=float(amp.get("f_max", 196.125e12)), format="%.2e", key="amp_f_max")
-        
-        # nf0 for fixed_gain type
-        nf0 = st.number_input("nf0 (dB) [for fixed_gain type]", value=float(amp.get("nf0", 6.0)), key="amp_nf0")
-        allowed_for_design = st.checkbox("allowed_for_design", value=amp.get("allowed_for_design", True), key="amp_allowed")
+
+        # Discriminator: choosing a type_def re-renders the valid field set.
+        current_def = amp.get("type_def", "variable_gain")
+        type_def = st.selectbox(
+            "type_def (noise/gain model)",
+            schema.EDFA_TYPE_DEFS,
+            index=schema.EDFA_TYPE_DEFS.index(current_def) if current_def in schema.EDFA_TYPE_DEFS else 0,
+            key="amp_type_def",
+            help="Determines which parameters are required for this amplifier.",
+        )
+
+        # dual_stage / multi_band reference other single-band amplifiers.
+        ref_varieties = list_amplifier_varieties(folder)
+
+        specs = schema.edfa_field_specs(type_def, known_varieties=ref_varieties)
+        values = render_schema_fields(specs, amp, key_prefix="amp", ref_options=ref_varieties)
+
+        built = schema.build_edfa(values, type_def)
+        errors, warnings = schema.validate_edfa(built, known_varieties=ref_varieties)
+
+        for w in warnings:
+            st.warning(w)
 
         c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("💾 Save", type="primary", use_container_width=True, key="save_amp"):
-                if not name.strip() or not type_variety.strip():
-                    st.error("Name and type_variety are required")
+                if not name.strip():
+                    st.error("Name (filename) is required")
+                elif errors:
+                    for e in errors:
+                        st.error(e)
                 else:
-                    data = {
-                        "type_variety": type_variety.strip(),
-                        "type_def": type_def,
-                        "gain_flatmax": gain_flatmax,
-                        "gain_min": gain_min,
-                        "p_max": p_max,
-                        "nf_min": nf_min,
-                        "nf_max": nf_max,
-                        "nf0": nf0,
-                        "out_voa_auto": out_voa_auto,
-                        "allowed_for_design": allowed_for_design,
-                        "f_min": f_min,
-                        "f_max": f_max,
-                    }
-                    if save_json_file(folder / f"{name.strip()}.json", data):
+                    if save_json_file(folder / f"{name.strip()}.json", built):
+                        st.session_state.lib_amp_data = built
+                        st.session_state.lib_amp_name = name.strip()
                         st.success(f"Saved: {name}")
                         st.rerun()
         with c2:
@@ -294,48 +422,49 @@ def render_amplifier_library():
                 st.rerun()
         with c3:
             if st.button("📋 Preview JSON", use_container_width=True, key="preview_amp"):
-                st.json({
-                    "type_variety": type_variety,
-                    "type_def": type_def,
-                    "gain_flatmax": gain_flatmax,
-                    "gain_min": gain_min,
-                    "p_max": p_max,
-                    "nf_min": nf_min,
-                    "nf_max": nf_max,
-                    "nf0": nf0,
-                    "out_voa_auto": out_voa_auto,
-                    "allowed_for_design": allowed_for_design,
-                    "f_min": f_min,
-                    "f_max": f_max,
-                })
+                st.json(built)
 
 
 def render_fiber_library():
     st.subheader("Fiber Types Library")
-    folder = LIBRARY_DIR / "fibers"
+    st.caption(
+        "Define Fiber or RamanFiber types. The dispersion model switches the "
+        "available fields (scalar coefficient vs per-frequency table)."
+    )
+
+    kind = st.radio(
+        "Component kind",
+        ["Fiber", "RamanFiber"],
+        horizontal=True,
+        key="fib_kind",
+        help="RamanFiber library types share the same parameters as Fiber. Raman "
+             "pumps are defined per topology instance, not in the library.",
+    )
+    folder = LIBRARY_DIR / ("raman_fibers" if kind == "RamanFiber" else "fibers")
     existing = list_json_files(folder)
 
     col1, col2 = st.columns([1, 2])
-    
+
     with col1:
-        st.markdown("**Saved Fiber Types**")
+        st.markdown(f"**Saved {kind} Types**")
         if existing:
             for name in existing:
                 c1, c2 = st.columns([3, 1])
                 with c1:
-                    if st.button(f"📄 {name}", key=f"load_fib_{name}", use_container_width=True):
-                        st.session_state.lib_fib_data = load_json_file(folder / f"{name}.json")
+                    if st.button(f"📄 {name}", key=f"load_fib_{kind}_{name}", use_container_width=True):
+                        st.session_state.lib_fib_data = unwrap_component(load_json_file(folder / f"{name}.json"))
                         st.session_state.lib_fib_name = name
+                        st.rerun()
                 with c2:
-                    if st.button("🗑️", key=f"del_fib_{name}"):
+                    if st.button("🗑️", key=f"del_fib_{kind}_{name}"):
                         delete_json_file(folder / f"{name}.json")
                         st.rerun()
         else:
-            st.info("No saved fiber types")
+            st.info(f"No saved {kind.lower()} types")
 
     with col2:
         st.markdown("**Editor**")
-        
+
         if "lib_fib_data" not in st.session_state:
             st.session_state.lib_fib_data = get_default_fiber()
         if "lib_fib_name" not in st.session_state:
@@ -344,39 +473,54 @@ def render_fiber_library():
         fib = st.session_state.lib_fib_data
 
         name = st.text_input("Name (filename)", value=st.session_state.lib_fib_name, key="fib_name_input")
-        
-        c1, c2 = st.columns(2)
-        with c1:
-            type_variety = st.text_input("type_variety *", value=fib.get("type_variety", ""), key="fib_variety")
-            dispersion = st.number_input("dispersion (s/m²)", value=float(fib.get("dispersion", 1.67e-05)), format="%.2e", key="fib_dispersion")
-            effective_area = st.number_input("effective_area (m²)", value=float(fib.get("effective_area", 83e-12)), format="%.2e", key="fib_eff_area")
-        with c2:
-            dispersion_slope = st.number_input("dispersion_slope (s/m³) [optional]", value=float(fib.get("dispersion_slope", 0.0)), format="%.2e", key="fib_disp_slope")
-            pmd_coef = st.number_input("pmd_coef (s/√m)", value=float(fib.get("pmd_coef", 1.265e-15)), format="%.3e", key="fib_pmd")
-            gamma = st.number_input("gamma (1/W/m) [optional, 0=auto]", value=float(fib.get("gamma", 0.0)), format="%.2e", key="fib_gamma")
+
+        current_mode = schema.detect_fiber_dispersion_mode(fib)
+        dispersion_mode = st.selectbox(
+            "Dispersion model",
+            schema.FIBER_DISPERSION_MODES,
+            index=schema.FIBER_DISPERSION_MODES.index(current_mode),
+            key="fib_disp_mode",
+            help="scalar: single dispersion coefficient. per_frequency: dispersion "
+                 "table evaluated at multiple frequencies.",
+        )
+
+        # Hydrate per-frequency list fields from a loaded dispersion_per_frequency dict.
+        seed = dict(fib)
+        if dispersion_mode == "per_frequency" and "dispersion_per_frequency" in fib:
+            dp = fib["dispersion_per_frequency"]
+            seed["dp_value"] = dp.get("value", [])
+            seed["dp_frequency"] = dp.get("frequency", [])
+
+        specs = schema.fiber_field_specs(dispersion_mode)
+        values = render_schema_fields(specs, seed, key_prefix="fib")
+
+        built = schema.build_fiber(values, dispersion_mode)
+        errors, warnings = schema.validate_fiber(built)
+        for w in warnings:
+            st.warning(w)
 
         c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("💾 Save", type="primary", use_container_width=True, key="save_fib"):
-                if not name.strip() or not type_variety.strip():
-                    st.error("Name and type_variety are required")
+                if not name.strip():
+                    st.error("Name (filename) is required")
+                elif errors:
+                    for e in errors:
+                        st.error(e)
                 else:
-                    data = {
-                        "type_variety": type_variety.strip(),
-                        "dispersion": dispersion,
-                        "dispersion_slope": dispersion_slope,
-                        "effective_area": effective_area,
-                        "gamma": gamma,
-                        "pmd_coef": pmd_coef
-                    }
-                    if save_json_file(folder / f"{name.strip()}.json", data):
-                        st.success(f"Saved: {name}")
+                    if save_json_file(folder / f"{name.strip()}.json", built):
+                        st.session_state.lib_fib_data = built
+                        st.session_state.lib_fib_name = name.strip()
+                        st.success(f"Saved {kind}: {name}")
                         st.rerun()
         with c2:
             if st.button("🆕 New", use_container_width=True, key="new_fib"):
                 st.session_state.lib_fib_data = get_default_fiber()
                 st.session_state.lib_fib_name = ""
                 st.rerun()
+        with c3:
+            if st.button("📋 Preview JSON", use_container_width=True, key="preview_fib"):
+                st.json(built)
 
 
 def render_transceiver_library():
@@ -393,8 +537,11 @@ def render_transceiver_library():
                 c1, c2 = st.columns([3, 1])
                 with c1:
                     if st.button(f"📄 {name}", key=f"load_trx_{name}", use_container_width=True):
-                        st.session_state.lib_trx_data = load_json_file(folder / f"{name}.json")
+                        loaded = unwrap_component(load_json_file(folder / f"{name}.json"))
+                        st.session_state.lib_trx_data = loaded
                         st.session_state.lib_trx_name = name
+                        st.session_state.lib_trx_modes = list(loaded.get("mode", []))
+                        st.rerun()
                 with c2:
                     if st.button("🗑️", key=f"del_trx_{name}"):
                         delete_json_file(folder / f"{name}.json")
@@ -404,51 +551,34 @@ def render_transceiver_library():
 
     with col2:
         st.markdown("**Editor**")
-        
+        st.caption("Strict GNPy schema. Non-standard vendor fields are not exported.")
+
         if "lib_trx_data" not in st.session_state:
             st.session_state.lib_trx_data = get_default_transceiver()
         if "lib_trx_name" not in st.session_state:
             st.session_state.lib_trx_name = ""
+        if "lib_trx_modes" not in st.session_state:
+            st.session_state.lib_trx_modes = list(st.session_state.lib_trx_data.get("mode", []))
 
         trx = st.session_state.lib_trx_data
 
         name = st.text_input("Name (filename)", value=st.session_state.lib_trx_name, key="trx_name_input")
         type_variety = st.text_input("type_variety *", value=trx.get("type_variety", ""), key="trx_variety")
-        
+
         c1, c2 = st.columns(2)
         with c1:
-            freq_min = st.number_input("freq_min (Hz)", value=float(trx.get("frequency", {}).get("min", 191.35e12)), format="%.2e", key="trx_freq_min")
+            freq_min = st.number_input("frequency.min (Hz)", value=float(trx.get("frequency", {}).get("min", 191.35e12)), format="%.4e", key="trx_freq_min")
         with c2:
-            freq_max = st.number_input("freq_max (Hz)", value=float(trx.get("frequency", {}).get("max", 196.1e12)), format="%.2e", key="trx_freq_max")
+            freq_max = st.number_input("frequency.max (Hz)", value=float(trx.get("frequency", {}).get("max", 196.1e12)), format="%.4e", key="trx_freq_max")
 
         # Modes editor
         st.markdown("**Modes**")
-        modes = trx.get("mode", [])
-        
-        if "lib_trx_modes" not in st.session_state:
-            st.session_state.lib_trx_modes = modes.copy() if modes else []
-
-        # Display existing modes
         for i, mode in enumerate(st.session_state.lib_trx_modes):
             with st.expander(f"Mode: {mode.get('format', 'unnamed')}", expanded=False):
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    mode["format"] = st.text_input("format", value=mode.get("format", ""), key=f"mode_fmt_{i}")
-                    mode["baud_rate"] = st.number_input("baud_rate", value=float(mode.get("baud_rate", 32e9)), format="%.2e", key=f"mode_baud_{i}")
-                with c2:
-                    mode["OSNR"] = st.number_input("OSNR (dB)", value=float(mode.get("OSNR", 12.0)), key=f"mode_osnr_{i}")
-                    mode["bit_rate"] = st.number_input("bit_rate", value=float(mode.get("bit_rate", 100e9)), format="%.2e", key=f"mode_bitrate_{i}")
-                with c3:
-                    mode["roll_off"] = st.number_input("roll_off", value=float(mode.get("roll_off", 0.15)), key=f"mode_rolloff_{i}")
-                    mode["tx_osnr"] = st.number_input("tx_osnr (dB)", value=float(mode.get("tx_osnr", 40.0)), key=f"mode_txosnr_{i}")
-                with c4:
-                    mode["min_spacing"] = st.number_input("min_spacing", value=float(mode.get("min_spacing", 50e9)), format="%.2e", key=f"mode_spacing_{i}")
-                    mode["cost"] = st.number_input("cost", value=float(mode.get("cost", 1.0)), key=f"mode_cost_{i}")
-                
-                # Additional optional fields
-                mode["equalization_offset_db"] = st.number_input("equalization_offset_db [optional]", value=float(mode.get("equalization_offset_db", 0.0)), key=f"mode_eq_offset_{i}")
-                
-                if st.button("Remove Mode", key=f"remove_mode_{i}"):
+                mvals = render_schema_fields(schema.transceiver_mode_specs(), mode, key_prefix=f"trxmode_{i}")
+                penalties = _render_penalties_editor(mode.get("penalties", []), key_prefix=f"trxpen_{i}")
+                st.session_state.lib_trx_modes[i] = schema.build_transceiver_mode(mvals, penalties)
+                if st.button("🗑️ Remove Mode", key=f"remove_mode_{i}"):
                     st.session_state.lib_trx_modes.pop(i)
                     st.rerun()
 
@@ -456,18 +586,23 @@ def render_transceiver_library():
             st.session_state.lib_trx_modes.append(get_default_transceiver_mode())
             st.rerun()
 
-        c1, c2 = st.columns(2)
+        built = schema.build_transceiver(type_variety, freq_min, freq_max, st.session_state.lib_trx_modes)
+        errors, warnings = schema.validate_transceiver(built)
+        for w in warnings:
+            st.warning(w)
+
+        c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("💾 Save", type="primary", use_container_width=True, key="save_trx"):
-                if not name.strip() or not type_variety.strip():
-                    st.error("Name and type_variety are required")
+                if not name.strip():
+                    st.error("Name (filename) is required")
+                elif errors:
+                    for e in errors:
+                        st.error(e)
                 else:
-                    data = {
-                        "type_variety": type_variety.strip(),
-                        "frequency": {"min": freq_min, "max": freq_max},
-                        "mode": st.session_state.lib_trx_modes
-                    }
-                    if save_json_file(folder / f"{name.strip()}.json", data):
+                    if save_json_file(folder / f"{name.strip()}.json", built):
+                        st.session_state.lib_trx_data = built
+                        st.session_state.lib_trx_name = name.strip()
                         st.success(f"Saved: {name}")
                         st.rerun()
         with c2:
@@ -476,6 +611,9 @@ def render_transceiver_library():
                 st.session_state.lib_trx_name = ""
                 st.session_state.lib_trx_modes = []
                 st.rerun()
+        with c3:
+            if st.button("📋 Preview JSON", use_container_width=True, key="preview_trx"):
+                st.json(built)
 
 
 def render_roadm_library():
@@ -503,7 +641,7 @@ def render_roadm_library():
 
     with col2:
         st.markdown("**Editor**")
-        
+
         if "lib_roadm_data" not in st.session_state:
             st.session_state.lib_roadm_data = get_default_roadm()
         if "lib_roadm_name" not in st.session_state:
@@ -512,31 +650,50 @@ def render_roadm_library():
         roadm = st.session_state.lib_roadm_data
 
         name = st.text_input("Name (filename)", value=st.session_state.lib_roadm_name, key="roadm_name_input")
-        
-        c1, c2 = st.columns(2)
-        with c1:
-            type_variety = st.text_input("type_variety", value=roadm.get("type_variety", "default"), key="roadm_variety")
-            target_pch = st.number_input("target_pch_out_db", value=float(roadm.get("target_pch_out_db", -20.0)), key="roadm_pch")
-            pmd = st.number_input("pmd", value=float(roadm.get("pmd", 0.0)), key="roadm_pmd")
-        with c2:
-            add_drop_osnr = st.number_input("add_drop_osnr", value=float(roadm.get("add_drop_osnr", 38.0)), key="roadm_osnr")
-            pdl = st.number_input("pdl", value=float(roadm.get("pdl", 0.0)), key="roadm_pdl")
 
-        c1, c2 = st.columns(2)
+        # Discriminator: equalization strategies are mutually exclusive.
+        current_eq = schema.detect_roadm_equalization(roadm)
+        equalization = st.selectbox(
+            "Equalization strategy",
+            schema.ROADM_EQUALIZATION_STRATEGIES,
+            index=schema.ROADM_EQUALIZATION_STRATEGIES.index(current_eq),
+            key="roadm_eq",
+            help="Exactly one target is written: per-channel power (pch), power "
+                 "spectral density (psd), or power per slot width (psw).",
+        )
+
+        # Restriction selectors reference amplifiers from the library.
+        amp_varieties = list_amplifier_varieties(LIBRARY_DIR / "amplifiers")
+
+        # Seed restriction list fields from the nested restrictions dict.
+        seed = dict(roadm)
+        restr = roadm.get("restrictions", {})
+        seed["preamp_variety_list"] = restr.get("preamp_variety_list", [])
+        seed["booster_variety_list"] = restr.get("booster_variety_list", [])
+
+        specs = schema.roadm_field_specs(equalization, amp_varieties=amp_varieties)
+        values = render_schema_fields(specs, seed, key_prefix="roadm", ref_options=amp_varieties)
+
+        # Preserve advanced structures (impairments/design bands) from loaded data.
+        built = schema.build_roadm(values, equalization, preserve=roadm)
+        errors, warnings = schema.validate_roadm(built, amp_varieties=amp_varieties)
+        for w in warnings:
+            st.warning(w)
+        if roadm.get("roadm-path-impairments"):
+            st.caption("ℹ️ Existing `roadm-path-impairments` are preserved on save (edit via JSON).")
+
+        c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("💾 Save", type="primary", use_container_width=True, key="save_roadm"):
                 if not name.strip():
-                    st.error("Name is required")
+                    st.error("Name (filename) is required")
+                elif errors:
+                    for e in errors:
+                        st.error(e)
                 else:
-                    data = {
-                        "type_variety": type_variety.strip() or "default",
-                        "target_pch_out_db": target_pch,
-                        "add_drop_osnr": add_drop_osnr,
-                        "pmd": pmd,
-                        "pdl": pdl,
-                        "restrictions": {"preamp_variety_list": [], "booster_variety_list": []}
-                    }
-                    if save_json_file(folder / f"{name.strip()}.json", data):
+                    if save_json_file(folder / f"{name.strip()}.json", built):
+                        st.session_state.lib_roadm_data = built
+                        st.session_state.lib_roadm_name = name.strip()
                         st.success(f"Saved: {name}")
                         st.rerun()
         with c2:
@@ -544,6 +701,9 @@ def render_roadm_library():
                 st.session_state.lib_roadm_data = get_default_roadm()
                 st.session_state.lib_roadm_name = ""
                 st.rerun()
+        with c3:
+            if st.button("📋 Preview JSON", use_container_width=True, key="preview_roadm"):
+                st.json(built)
 
 
 def render_si_params_library():
@@ -560,8 +720,9 @@ def render_si_params_library():
                 c1, c2 = st.columns([3, 1])
                 with c1:
                     if st.button(f"📄 {name}", key=f"load_si_{name}", use_container_width=True):
-                        st.session_state.lib_si_data = load_json_file(folder / f"{name}.json")
+                        st.session_state.lib_si_data = unwrap_component(load_json_file(folder / f"{name}.json"))
                         st.session_state.lib_si_name = name
+                        st.rerun()
                 with c2:
                     if st.button("🗑️", key=f"del_si_{name}"):
                         delete_json_file(folder / f"{name}.json")
@@ -571,7 +732,12 @@ def render_si_params_library():
 
     with col2:
         st.markdown("**Editor**")
-        
+        st.caption(
+            "SI defines the **design reference channel** + spectrum bounds. It "
+            "overlaps with transceiver modes on baud_rate / roll_off / tx_osnr / "
+            "spacing — use the prefill below to keep them coherent."
+        )
+
         if "lib_si_data" not in st.session_state:
             st.session_state.lib_si_data = get_default_si_params()
         if "lib_si_name" not in st.session_state:
@@ -580,43 +746,71 @@ def render_si_params_library():
         si = st.session_state.lib_si_data
 
         name = st.text_input("Name (filename)", value=st.session_state.lib_si_name, key="si_name_input")
-        
-        type_variety = st.text_input("type_variety [optional, for multiband]", value=si.get("type_variety", "default"), key="si_type_variety")
-        
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            f_min = st.number_input("f_min (Hz)", value=float(si.get("f_min", 191.3e12)), format="%.2e", key="si_fmin")
-            baud_rate = st.number_input("baud_rate (Hz)", value=float(si.get("baud_rate", 32e9)), format="%.2e", key="si_baud")
-            power_dbm = st.number_input("power_dbm", value=float(si.get("power_dbm", 0.0)), key="si_power")
-        with c2:
-            f_max = st.number_input("f_max (Hz)", value=float(si.get("f_max", 196.1e12)), format="%.2e", key="si_fmax")
-            spacing = st.number_input("spacing (Hz)", value=float(si.get("spacing", 50e9)), format="%.2e", key="si_spacing")
-            tx_power_dbm = st.number_input("tx_power_dbm", value=float(si.get("tx_power_dbm", 0.0)), key="si_tx_power")
-        with c3:
-            roll_off = st.number_input("roll_off", value=float(si.get("roll_off", 0.15)), key="si_rolloff")
-            tx_osnr = st.number_input("tx_osnr", value=float(si.get("tx_osnr", 40.0)), key="si_txosnr")
-            sys_margins = st.number_input("sys_margins", value=float(si.get("sys_margins", 2.0)), key="si_margins")
 
-        c1, c2 = st.columns(2)
+        # --- Overlap helper: prefill SI design channel from a transceiver mode ---
+        trx_folder = LIBRARY_DIR / "transceivers"
+        trx_files = list_json_files(trx_folder)
+        trx_lookup: dict[str, dict] = {}
+        for tname in trx_files:
+            tdata = unwrap_component(load_json_file(trx_folder / f"{tname}.json"))
+            if tdata:
+                trx_lookup[tname] = tdata
+
+        with st.expander("↪ Prefill from a transceiver mode (coherence helper)", expanded=False):
+            pc1, pc2 = st.columns(2)
+            with pc1:
+                sel_trx = st.selectbox("Transceiver", options=[""] + list(trx_lookup.keys()), key="si_prefill_trx")
+            modes_for_trx = trx_lookup.get(sel_trx, {}).get("mode", []) if sel_trx else []
+            mode_formats = [m.get("format", "") for m in modes_for_trx]
+            with pc2:
+                sel_mode = st.selectbox("Mode", options=[""] + mode_formats, key="si_prefill_mode")
+            if sel_trx and sel_mode and st.button("Apply prefill", key="si_apply_prefill"):
+                mode = next((m for m in modes_for_trx if m.get("format") == sel_mode), None)
+                if mode:
+                    updated = dict(si)
+                    updated["baud_rate"] = mode.get("baud_rate", si.get("baud_rate"))
+                    updated["roll_off"] = mode.get("roll_off", si.get("roll_off"))
+                    updated["tx_osnr"] = mode.get("tx_osnr", si.get("tx_osnr"))
+                    # spacing must be at least the mode's min slot size.
+                    updated["spacing"] = max(float(mode.get("min_spacing", 0) or 0), float(si.get("spacing", 0) or 0))
+                    freq = trx_lookup[sel_trx].get("frequency", {})
+                    if freq:
+                        updated["f_min"] = freq.get("min", si.get("f_min"))
+                        updated["f_max"] = freq.get("max", si.get("f_max"))
+                    st.session_state.lib_si_data = updated
+                    st.success(f"Prefilled from {sel_trx} / {sel_mode}")
+                    st.rerun()
+
+        specs = schema.si_field_specs()
+        values = render_schema_fields(specs, si, key_prefix="si")
+        built = schema.build_si(values)
+
+        errors, warnings = schema.validate_si(built)
+        for w in warnings:
+            st.warning(w)
+
+        # Live coherence check against the currently selected transceiver mode.
+        if st.session_state.get("si_prefill_trx") and st.session_state.get("si_prefill_mode"):
+            sel_trx = st.session_state["si_prefill_trx"]
+            sel_mode = st.session_state["si_prefill_mode"]
+            tdata = trx_lookup.get(sel_trx, {})
+            mode = next((m for m in tdata.get("mode", []) if m.get("format") == sel_mode), None)
+            if mode:
+                for w in schema.si_transceiver_coherence(built, mode, tdata.get("frequency")):
+                    st.warning(f"Coherence: {w}")
+
+        c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("💾 Save", type="primary", use_container_width=True, key="save_si"):
                 if not name.strip():
-                    st.error("Name is required")
+                    st.error("Name (filename) is required")
+                elif errors:
+                    for e in errors:
+                        st.error(e)
                 else:
-                    data = {
-                        "type_variety": type_variety.strip() or "default",
-                        "f_min": f_min,
-                        "f_max": f_max,
-                        "baud_rate": baud_rate,
-                        "spacing": spacing,
-                        "power_dbm": power_dbm,
-                        "power_range_db": [0, 0, 1],
-                        "tx_power_dbm": tx_power_dbm,
-                        "roll_off": roll_off,
-                        "tx_osnr": tx_osnr,
-                        "sys_margins": sys_margins
-                    }
-                    if save_json_file(folder / f"{name.strip()}.json", data):
+                    if save_json_file(folder / f"{name.strip()}.json", built):
+                        st.session_state.lib_si_data = built
+                        st.session_state.lib_si_name = name.strip()
                         st.success(f"Saved: {name}")
                         st.rerun()
         with c2:
@@ -624,6 +818,9 @@ def render_si_params_library():
                 st.session_state.lib_si_data = get_default_si_params()
                 st.session_state.lib_si_name = ""
                 st.rerun()
+        with c3:
+            if st.button("📋 Preview JSON", use_container_width=True, key="preview_si"):
+                st.json(built)
 
 
 # =============================================================================
@@ -1291,33 +1488,33 @@ def render_project_assembler():
             else:
                 equipment = {"Edfa": [], "Fiber": [], "RamanFiber": [], "Span": [], "Roadm": [], "SI": [], "Transceiver": []}
                 
-                # Add amplifiers
+                # Add amplifiers (flattened to GNPy-native shape)
                 for amp_name in selected_amps:
-                    amp_data = load_json_file(LIBRARY_DIR / "amplifiers" / f"{amp_name}.json")
+                    amp_data = unwrap_component(load_json_file(LIBRARY_DIR / "amplifiers" / f"{amp_name}.json"))
                     if amp_data:
                         equipment["Edfa"].append(amp_data)
                 
                 # Add fiber types
                 for fib_name in selected_fibers:
-                    fib_data = load_json_file(LIBRARY_DIR / "fibers" / f"{fib_name}.json")
+                    fib_data = unwrap_component(load_json_file(LIBRARY_DIR / "fibers" / f"{fib_name}.json"))
                     if fib_data:
                         equipment["Fiber"].append(fib_data)
                 
                 # Add ROADMs
                 for roadm_name in selected_roadms:
-                    roadm_data = load_json_file(LIBRARY_DIR / "roadms" / f"{roadm_name}.json")
+                    roadm_data = unwrap_component(load_json_file(LIBRARY_DIR / "roadms" / f"{roadm_name}.json"))
                     if roadm_data:
                         equipment["Roadm"].append(roadm_data)
                 
-                # Add transceivers
+                # Add transceivers (normalized to strict GNPy schema on export)
                 for trx_name in selected_trx:
-                    trx_data = load_json_file(LIBRARY_DIR / "transceivers" / f"{trx_name}.json")
+                    trx_data = unwrap_component(load_json_file(LIBRARY_DIR / "transceivers" / f"{trx_name}.json"))
                     if trx_data:
-                        equipment["Transceiver"].append(trx_data)
+                        equipment["Transceiver"].append(_strict_transceiver(trx_data))
                 
                 # Add SI parameters
                 if selected_si and selected_si != "(default)":
-                    si_data = load_json_file(LIBRARY_DIR / "simulation_params" / f"{selected_si}.json")
+                    si_data = unwrap_component(load_json_file(LIBRARY_DIR / "simulation_params" / f"{selected_si}.json"))
                     if si_data:
                         equipment["SI"].append(si_data)
                 else:

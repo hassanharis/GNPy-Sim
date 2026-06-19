@@ -28,37 +28,37 @@ from gnpy.tools.json_io import load_equipment
 from gnpy.topology.request import PathRequest
 
 st.markdown(gnpy.tools.json_io.load_network(filename= Path, equipment= {
-  "Edfa": [{
-      "type_variety": "std_medium_gain",
-      "type_def": "variable_gain",
-      "gain_flatmax": 26,
-      "gain_min": 15,
-      "p_max": 23,
-      "nf_min": 6,
-      "nf_max": 10,
-      "out_voa_auto": false,
-      "allowed_for_design": true
-    },
-    {
-      "type_variety": "std_low_gain",
-      "type_def": "variable_gain",
-      "gain_flatmax": 16,
-      "gain_min": 8,
-      "p_max": 23,
-      "nf_min": 6.5,
-      "nf_max": 11,
-      "out_voa_auto": false,
-      "allowed_for_design": true
-      }
-    ],
-  "Fiber": [{
-      "type_variety": "SSMF",
-      "dispersion": 1.67e-05,
-      "effective_area": 83e-12,
-      "pmd_coef": 1.265e-15
-    }
-  ]
-})
+    "Edfa": [{
+        "type_variety": "std_medium_gain",
+        "type_def": "variable_gain",
+        "gain_flatmax": 26,
+        "gain_min": 15,
+        "p_max": 23,
+        "nf_min": 6,
+        "nf_max": 10,
+        "out_voa_auto": false,
+        "allowed_for_design": true
+        },
+        {
+        "type_variety": "std_low_gain",
+        "type_def": "variable_gain",
+        "gain_flatmax": 16,
+        "gain_min": 8,
+        "p_max": 23,
+        "nf_min": 6.5,
+        "nf_max": 11,
+        "out_voa_auto": false,
+        "allowed_for_design": true
+        }
+        ],
+    "Fiber": [{
+        "type_variety": "SSMF",
+        "dispersion": 1.67e-05,
+        "effective_area": 83e-12,
+        "pmd_coef": 1.265e-15
+        }
+    ]
+    })
 
 # Page configuration
 st.set_page_config(
