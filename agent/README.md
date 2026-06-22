@@ -101,6 +101,23 @@ instruct model (Qwen2.5 14B+/Qwen3, Llama 3.3 70B class). Very small models
 (≤8B) often fail multi-step tool loops. If your hardware is limited, keep to the
 read/guidance use cases rather than autonomous building.
 
+## Troubleshooting: "Failed to load model from file" (llamacpp)
+
+The path is correct but llama.cpp cannot load the GGUF. In order of likelihood:
+
+1. **Not enough VRAM for full GPU offload.** `n_gpu_layers=-1` tries to put every
+   layer on the GPU. A Q8_0 8B model is ~8.7 GB and an RTX with little free VRAM
+   will fail. Fix: lower `n_gpu_layers` in the sidebar (e.g. 20), or set it to `0`
+   (CPU). Q8_0 is heavy - prefer a `Q4_K_M` build for big models.
+2. **`n_ctx` too large** for available memory. Try `8192`.
+3. **CPU-only `llama-cpp-python` wheel** but GPU offload requested. Reinstall a
+   CUDA wheel (see `requirements-agent.txt`) or set `n_gpu_layers=0`.
+4. **`llama-cpp-python` too old** for the model architecture. `pip install -U llama-cpp-python`.
+5. **Corrupt / incomplete download.** Re-download the `.gguf`.
+
+Tick **"Verbose llama.cpp logs"** in the sidebar (GGUF / GPU settings) to print
+the raw llama.cpp error to the terminal running Streamlit.
+
 ## Notes / current limitations
 
 - Human-in-the-loop is enforced via the preview→confirm→save flow and the system

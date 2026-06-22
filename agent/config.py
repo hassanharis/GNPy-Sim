@@ -70,6 +70,7 @@ class AgentModelConfig:
     n_gpu_layers: int = -1  # -1 = offload all layers to GPU
     n_threads: int = max(4, (os.cpu_count() or 8) // 2)
     max_tokens: int = 2048
+    verbose: bool = False  # llama.cpp logs to console (useful for load errors)
     models_dir: Path = MODELS_DIR
 
     def __post_init__(self) -> None:
@@ -106,6 +107,7 @@ def config_from_env() -> AgentModelConfig:
         num_ctx=int(os.getenv("GNPY_AGENT_NUM_CTX", "8192")),
         n_gpu_layers=int(os.getenv("GNPY_AGENT_N_GPU_LAYERS", "-1")),
         max_tokens=int(os.getenv("GNPY_AGENT_MAX_TOKENS", "2048")),
+        verbose=os.getenv("GNPY_AGENT_VERBOSE", "").lower() in ("1", "true", "yes"),
     )
 
 
@@ -198,15 +200,39 @@ def build_chat_model(cfg: AgentModelConfig | None = None):
                 "Put a .gguf file in your models folder, set GGUF_MODEL_PATH, or "
                 "download one (see agent/models.download_gguf_model)."
             )
-        return ChatLlamaCpp(
-            model_path=str(model_path),
-            n_ctx=cfg.num_ctx,
-            n_gpu_layers=cfg.n_gpu_layers,
-            n_threads=cfg.n_threads,
-            temperature=cfg.temperature,
-            max_tokens=cfg.max_tokens,
-            verbose=False,
-        )
+        # Catch incomplete downloads early (real GGUFs are tens to thousands of MB).
+        size_mb = model_path.stat().st_size / (1024 * 1024)
+        if size_mb < 5:
+            raise RuntimeError(
+                f"GGUF file looks incomplete ({size_mb:.1f} MB): {model_path}. "
+                "Re-download the model; the file is likely truncated."
+            )
+        try:
+            return ChatLlamaCpp(
+                model_path=str(model_path),
+                n_ctx=cfg.num_ctx,
+                n_gpu_layers=cfg.n_gpu_layers,
+                n_threads=cfg.n_threads,
+                temperature=cfg.temperature,
+                max_tokens=cfg.max_tokens,
+                verbose=cfg.verbose,
+            )
+        except Exception as exc:  # noqa: BLE001 - turn into an actionable message
+            raise RuntimeError(
+                f"llama.cpp could not load the model ({size_mb:.0f} MB):\n"
+                f"  {model_path}\n\n"
+                "Common causes and fixes:\n"
+                f"  - Not enough VRAM with n_gpu_layers={cfg.n_gpu_layers}. Lower "
+                "n_gpu_layers in the sidebar (e.g. 20), or set it to 0 for CPU.\n"
+                f"  - n_ctx={cfg.num_ctx} too large for available memory. Try 8192.\n"
+                "  - llama-cpp-python too old for this model architecture. Upgrade:\n"
+                "      pip install -U llama-cpp-python\n"
+                "  - CPU-only wheel installed but GPU offload requested. Reinstall a\n"
+                "    CUDA wheel (see requirements-agent.txt) or set n_gpu_layers=0.\n"
+                "  - Corrupt/incomplete download. Re-download the .gguf.\n\n"
+                "Enable 'Verbose llama.cpp logs' in the sidebar to see the raw "
+                f"llama.cpp error in the console.\n\nOriginal error: {exc}"
+            ) from exc
 
     # provider == "openai" (OpenAI-compatible local server, e.g. vLLM)
     try:

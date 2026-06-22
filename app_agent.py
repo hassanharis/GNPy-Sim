@@ -74,6 +74,7 @@ def sidebar_config() -> AgentModelConfig:
     # llamacpp-specific knobs
     n_gpu_layers, n_threads, max_tokens = -1, max(4, 4), 2048
     num_ctx = 8192
+    verbose = False
 
     if provider in ("ollama", "openai"):
         base_url = st.sidebar.text_input("Base URL", value=base_url)
@@ -91,13 +92,18 @@ def sidebar_config() -> AgentModelConfig:
             import os as _os
             n_threads = st.number_input(
                 "n_threads", 1, 64, max(4, (_os.cpu_count() or 8) // 2), step=1)
+            verbose = st.checkbox(
+                "Verbose llama.cpp logs", value=False,
+                help="Print the raw llama.cpp load/inference logs to the console "
+                     "(run terminal). Use this to debug model load failures.")
 
     temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.1, 0.05)
 
     cfg = AgentModelConfig(
         provider=provider, model=model, base_url=base_url, api_key=api_key,
         temperature=temperature, num_ctx=int(num_ctx), n_gpu_layers=int(n_gpu_layers),
-        n_threads=int(n_threads), max_tokens=int(max_tokens), models_dir=models_dir,
+        n_threads=int(n_threads), max_tokens=int(max_tokens), verbose=verbose,
+        models_dir=models_dir,
     )
 
     st.sidebar.markdown("---")
@@ -122,13 +128,14 @@ def sidebar_config() -> AgentModelConfig:
 # =============================================================================
 @st.cache_resource(show_spinner=False)
 def get_agent(provider: str, model: str, base_url: str, api_key: str, temperature: float,
-              num_ctx: int, n_gpu_layers: int, n_threads: int, max_tokens: int, models_dir: str):
+              num_ctx: int, n_gpu_layers: int, n_threads: int, max_tokens: int,
+              verbose: bool, models_dir: str):
     from agent.agent import build_agent
 
     cfg = AgentModelConfig(
         provider=provider, model=model, base_url=base_url, api_key=api_key,
         temperature=temperature, num_ctx=num_ctx, n_gpu_layers=n_gpu_layers,
-        n_threads=n_threads, max_tokens=max_tokens, models_dir=models_dir,
+        n_threads=n_threads, max_tokens=max_tokens, verbose=verbose, models_dir=models_dir,
     )
     return build_agent(cfg)
 
@@ -200,7 +207,8 @@ def main():
     try:
         agent = get_agent(
             cfg.provider, cfg.model, cfg.base_url, cfg.api_key, cfg.temperature,
-            cfg.num_ctx, cfg.n_gpu_layers, cfg.n_threads, cfg.max_tokens, str(cfg.models_dir),
+            cfg.num_ctx, cfg.n_gpu_layers, cfg.n_threads, cfg.max_tokens, cfg.verbose,
+            str(cfg.models_dir),
         )
     except ImportError as e:
         st.warning(
