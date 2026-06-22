@@ -67,7 +67,9 @@ with the manual input generator). No business logic is duplicated.
      Drop a `.gguf` file into the models folder (default `./models/`), or set
      `GGUF_MODEL_PATH`. For an RTX 4090 24 GB, a 32B instruct GGUF at Q4_K_M with
      `n_ctx=8192` and `n_gpu_layers=-1` is a good target. You can download a
-     curated build from `agent.models.download_gguf_model(repo_id, filename)`.
+     curated build from the sidebar (**"Download a GGUF model"**, needs network +
+     `huggingface_hub`) or from code via
+     `agent.models.download_gguf_model(repo_id, filename)`.
 
 3. Run the app:
 

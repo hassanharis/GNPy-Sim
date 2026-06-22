@@ -17,6 +17,7 @@ import streamlit as st
 from agent.config import (
     DEFAULT_BASE_URLS,
     DEFAULT_MODELS,
+    KNOWN_GGUF_MODELS,
     MODELS_DIR,
     SUPPORTED_PROVIDERS,
     AgentModelConfig,
@@ -48,6 +49,39 @@ def _model_picker(provider: str, base_url: str, api_key: str, models_dir: str, d
         return st.sidebar.text_input("Model (manual)", value=default_model)
     st.sidebar.caption("No models auto-detected - enter one manually.")
     return st.sidebar.text_input("Model", value=default_model)
+
+
+def render_download_section(models_dir: str) -> None:
+    """GGUF download UI (llamacpp). Needs network + huggingface_hub."""
+    with st.sidebar.expander("⬇️ Download a GGUF model"):
+        labels = [f"{fn}  ({repo})" for repo, fn in KNOWN_GGUF_MODELS]
+        choice = st.selectbox("Curated builds", labels + [_CUSTOM], key="dl_choice")
+        if choice == _CUSTOM:
+            repo_id = st.text_input("repo_id", key="dl_repo",
+                                    placeholder="bartowski/Qwen3-14B-GGUF")
+            filename = st.text_input("filename (.gguf)", key="dl_file",
+                                     placeholder="Qwen3-14B-Q4_K_M.gguf")
+        else:
+            repo_id, filename = KNOWN_GGUF_MODELS[labels.index(choice)]
+            st.caption(f"repo: `{repo_id}`")
+
+        st.caption(f"Saves to: `{models_dir}`")
+        if st.button("Download", key="dl_btn", use_container_width=True):
+            if not repo_id or not filename:
+                st.error("repo_id and filename are required.")
+                return
+            try:
+                from agent.models import download_gguf_model
+                with st.spinner(f"Downloading {filename} - watch the console for progress..."):
+                    path = download_gguf_model(repo_id, filename, models_dir)
+                st.success(f"Downloaded: {path}")
+                _cached_detect.clear()
+                st.rerun()
+            except ImportError:
+                st.error("huggingface_hub is not installed. Run "
+                         "`pip install huggingface_hub`.")
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Download failed: {e}")
 
 
 # =============================================================================
@@ -84,6 +118,7 @@ def sidebar_config() -> AgentModelConfig:
     else:  # llamacpp
         models_dir = st.sidebar.text_input("Models folder", value=models_dir)
         model = _model_picker(provider, base_url, api_key, models_dir, default_model)
+        render_download_section(models_dir)
         with st.sidebar.expander("GGUF / GPU settings"):
             num_ctx = st.number_input("n_ctx (context)", 2048, 131072, 8192, step=2048)
             n_gpu_layers = st.number_input(
