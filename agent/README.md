@@ -27,7 +27,8 @@ you **before** anything is written. The assistant only saves to
 ```
 app_agent.py            # separate Streamlit chat app
 agent/
-  config.py             # local model config (Ollama / OpenAI-compatible)
+  config.py             # local model config (Ollama / OpenAI-compatible / llama.cpp)
+  models.py             # auto-detect installed local models
   tools.py              # wraps gnpy_schema build/validate/default + library I/O
   datasheet.py          # local PDF/CSV/XLSX/text extraction
   agent.py              # create_deep_agent factory + system prompt
@@ -57,6 +58,16 @@ with the manual input generator). No business logic is duplicated.
      vllm serve Qwen/Qwen2.5-14B-Instruct --port 8000
      # base URL: http://localhost:8000/v1
      ```
+   - **llama.cpp GGUF on GPU** (Windows / RTX, in-process, no server):
+     ```bash
+     # CUDA-enabled wheel:
+     pip install llama-cpp-python --extra-index-url \
+       https://abetlen.github.io/llama-cpp-python/whl/cu124
+     ```
+     Drop a `.gguf` file into the models folder (default `./models/`), or set
+     `GGUF_MODEL_PATH`. For an RTX 4090 24 GB, a 32B instruct GGUF at Q4_K_M with
+     `n_ctx=8192` and `n_gpu_layers=-1` is a good target. You can download a
+     curated build from `agent.models.download_gguf_model(repo_id, filename)`.
 
 3. Run the app:
 
@@ -64,18 +75,24 @@ with the manual input generator). No business logic is duplicated.
    streamlit run app_agent.py
    ```
 
-   Pick the provider, model and base URL in the sidebar.
+   Pick the provider in the sidebar. **Installed models are auto-detected**
+   (Ollama tags, OpenAI `/models`, or `*.gguf` files in the models folder) and
+   shown in a dropdown; use "Re-detect models" to refresh, or enter one manually.
 
 ## Configuration (env vars, optional)
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `GNPY_AGENT_PROVIDER` | `ollama` | `ollama` or `openai` |
-| `GNPY_AGENT_MODEL` | provider default | model name / id |
-| `GNPY_AGENT_BASE_URL` | provider default | server URL |
+| `GNPY_AGENT_PROVIDER` | `ollama` | `ollama`, `openai` or `llamacpp` |
+| `GNPY_AGENT_MODEL` | provider default | model name / id, or `.gguf` filename |
+| `GNPY_AGENT_BASE_URL` | provider default | server URL (ollama/openai) |
 | `GNPY_AGENT_API_KEY` | `not-needed` | for OpenAI-compatible servers |
 | `GNPY_AGENT_TEMPERATURE` | `0.1` | sampling temperature |
-| `GNPY_AGENT_NUM_CTX` | `8192` | context window (Ollama) |
+| `GNPY_AGENT_NUM_CTX` | `8192` | context window (Ollama / llama.cpp `n_ctx`) |
+| `GNPY_AGENT_N_GPU_LAYERS` | `-1` | llama.cpp GPU offload (-1 = all) |
+| `GNPY_AGENT_MAX_TOKENS` | `2048` | llama.cpp max output tokens |
+| `GNPY_AGENT_MODELS_DIR` | `./models` | folder scanned for `.gguf` files |
+| `GGUF_MODEL_PATH` | — | explicit path to a `.gguf` (overrides model) |
 
 ## Model choice
 

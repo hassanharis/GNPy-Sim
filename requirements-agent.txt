@@ -18,6 +18,16 @@ langgraph>=0.2.0
 langchain-ollama>=0.2.0
 # OpenAI-compatible endpoints (vLLM / llama.cpp server / LM Studio):
 langchain-openai>=0.2.0
+# In-process GGUF on GPU (llamacpp provider): ChatLlamaCpp lives here
+langchain-community>=0.3.0
+
+# llama.cpp GGUF backend (Windows-friendly, CUDA). For GPU offload install a
+# CUDA-enabled wheel, e.g.:
+#   pip install llama-cpp-python --extra-index-url \
+#     https://abetlen.github.io/llama-cpp-python/whl/cu124
+llama-cpp-python>=0.3.0
+# Optional: download GGUF builds from Hugging Face (not needed if air-gapped)
+huggingface_hub>=0.24.0
 
 # --- Datasheet parsing (local, no network) ---
 pdfplumber>=0.11.0   # text + table extraction from PDF datasheets
