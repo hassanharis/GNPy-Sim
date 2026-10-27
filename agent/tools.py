@@ -15,6 +15,7 @@ follow a preview -> confirm -> save flow.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -85,6 +86,26 @@ def _as_dict(params: Union[dict, str, None]) -> dict:
 
 def _ok(payload: dict) -> str:
     return json.dumps(payload, indent=2, default=str)
+
+
+# =============================================================================
+# Preview-before-save gate
+# =============================================================================
+# A write tool (save_component) only proceeds if the EXACT component it would
+# write was previously produced by a successful preview_component call. This
+# enforces the "preview -> confirm -> save" flow in code, not just via the
+# prompt, so the model can't silently save un-previewed / hallucinated values.
+_PREVIEWED_SIGNATURES: set[str] = set()
+
+
+def _component_signature(category: str, built: dict) -> str:
+    """Stable hash of a built component, used to tie a save back to a preview."""
+    payload = json.dumps(
+        {"category": category.lower().strip(), "component": built},
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 # =============================================================================
@@ -249,8 +270,13 @@ def preview_component(category: str, params: Union[dict, str], discriminator: st
         )
     except Exception as e:  # noqa: BLE001
         return _ok({"error": str(e)})
+    cat = category.lower().strip()
+    # Only a clean (error-free) preview unlocks a subsequent save of this exact
+    # component.
+    if not errors:
+        _PREVIEWED_SIGNATURES.add(_component_signature(cat, built))
     return _ok({
-        "category": category.lower().strip(),
+        "category": cat,
         "valid": not errors,
         "errors": errors,
         "warnings": warnings,
@@ -341,6 +367,17 @@ def save_component(category: str, name: str, params: Union[dict, str], discrimin
         return _ok({"error": str(e)})
     if errors:
         return _ok({"saved": False, "errors": errors, "message": "Refusing to save invalid component."})
+
+    if _component_signature(cat, built) not in _PREVIEWED_SIGNATURES:
+        return _ok({
+            "saved": False,
+            "message": (
+                "Refusing to save: this exact component was not previewed. Call "
+                "preview_component with the same category, params and "
+                "discriminator first, show the user the result, get their "
+                "confirmation, then call save_component again."
+            ),
+        })
 
     folder = LIBRARY_DIR / CATEGORY_FOLDERS[cat]
     folder.mkdir(parents=True, exist_ok=True)

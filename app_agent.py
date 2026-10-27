@@ -109,6 +109,7 @@ def sidebar_config() -> AgentModelConfig:
     n_gpu_layers, n_threads, max_tokens = -1, max(4, 4), 2048
     num_ctx = 8192
     verbose = False
+    disable_thinking = True
 
     if provider in ("ollama", "openai"):
         base_url = st.sidebar.text_input("Base URL", value=base_url)
@@ -131,6 +132,12 @@ def sidebar_config() -> AgentModelConfig:
                 "Verbose llama.cpp logs", value=False,
                 help="Print the raw llama.cpp load/inference logs to the console "
                      "(run terminal). Use this to debug model load failures.")
+            disable_thinking = not st.checkbox(
+                "Enable model thinking/reasoning", value=False,
+                help="Reasoning models emit a hidden <think> block before every "
+                     "answer, which is slow even for trivial prompts. Leave OFF "
+                     "for fast replies; turn ON for harder multi-step tasks. "
+                     "Only affects models whose chat template supports it.")
 
     temperature = st.sidebar.slider("Temperature", 0.0, 1.0, 0.1, 0.05)
 
@@ -138,7 +145,7 @@ def sidebar_config() -> AgentModelConfig:
         provider=provider, model=model, base_url=base_url, api_key=api_key,
         temperature=temperature, num_ctx=int(num_ctx), n_gpu_layers=int(n_gpu_layers),
         n_threads=int(n_threads), max_tokens=int(max_tokens), verbose=verbose,
-        models_dir=models_dir,
+        disable_thinking=disable_thinking, models_dir=models_dir,
     )
 
     st.sidebar.markdown("---")
@@ -162,17 +169,65 @@ def sidebar_config() -> AgentModelConfig:
 # Agent lifecycle (rebuilt when config changes)
 # =============================================================================
 @st.cache_resource(show_spinner=False)
-def get_agent(provider: str, model: str, base_url: str, api_key: str, temperature: float,
-              num_ctx: int, n_gpu_layers: int, n_threads: int, max_tokens: int,
-              verbose: bool, models_dir: str):
-    from agent.agent import build_agent
+def _model_slot() -> dict:
+    """Single-slot holder for the loaded model + agent.
 
-    cfg = AgentModelConfig(
-        provider=provider, model=model, base_url=base_url, api_key=api_key,
-        temperature=temperature, num_ctx=num_ctx, n_gpu_layers=n_gpu_layers,
-        n_threads=n_threads, max_tokens=max_tokens, verbose=verbose, models_dir=models_dir,
+    Persists across Streamlit reruns/sessions (one model per GPU) while letting
+    us explicitly tear the old model down before loading a new one.
+    """
+    return {"sig": None, "model": None, "agent": None}
+
+
+def _config_signature(cfg: AgentModelConfig) -> tuple:
+    return (
+        cfg.provider, cfg.model, cfg.base_url, cfg.api_key, cfg.temperature,
+        cfg.num_ctx, cfg.n_gpu_layers, cfg.n_threads, cfg.max_tokens,
+        cfg.verbose, cfg.disable_thinking, str(cfg.models_dir),
     )
-    return build_agent(cfg)
+
+
+def _release_model(slot: dict) -> None:
+    """Free the currently loaded model so its VRAM is returned before reloading.
+
+    llama.cpp holds the weights in the in-process ``Llama`` client; closing it
+    releases the GPU/CPU buffers. Without this, switching models in the sidebar
+    would briefly hold two models and OOM the GPU.
+    """
+    model = slot.get("model")
+    slot["sig"] = None
+    slot["model"] = None
+    slot["agent"] = None
+    if model is None:
+        return
+    try:
+        client = getattr(model, "client", None)
+        if client is not None and hasattr(client, "close"):
+            client.close()
+    except Exception:  # noqa: BLE001 - best-effort teardown
+        pass
+    del model
+    import gc
+
+    gc.collect()
+
+
+def get_agent(cfg: AgentModelConfig):
+    """Return a cached agent for ``cfg``, freeing the previous model on change."""
+    slot = _model_slot()
+    sig = _config_signature(cfg)
+    if slot["sig"] == sig and slot["agent"] is not None:
+        return slot["agent"]
+
+    # Config changed (or first build): drop the old model before allocating.
+    _release_model(slot)
+
+    from agent.agent import build_agent
+    from agent.config import build_chat_model
+
+    model = build_chat_model(cfg)
+    agent = build_agent(model=model)
+    slot.update(sig=sig, model=model, agent=agent)
+    return agent
 
 
 def render_history():
@@ -188,45 +243,83 @@ def render_history():
                 st.markdown(content)
 
 
+def _chunk_text(content) -> str:
+    """Coerce a message chunk's content (str or list of blocks) to text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for block in content:
+            if isinstance(block, str):
+                out.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                out.append(block["text"])
+        return "".join(out)
+    return ""
+
+
 def run_agent_turn(agent, user_text: str):
-    """Stream one agent turn, showing tool activity, and persist the new state."""
+    """Stream one agent turn with live token output and persist the new state."""
     from langchain_core.messages import HumanMessage
 
-    history = st.session_state.get("lc_messages", [])
+    # Copy history so a mid-turn failure can't leave a dangling user message in
+    # session state (which would be resent on the next turn).
+    history = list(st.session_state.get("lc_messages", []))
     history.append(HumanMessage(content=user_text))
 
     inputs = {"messages": history}
     final_state = None
     with st.chat_message("assistant"):
         status = st.status("Thinking...", expanded=False)
+        placeholder = st.empty()
+        answer = ""
         try:
-            for chunk in agent.stream(inputs, stream_mode="values"):
-                final_state = chunk
-                msgs = chunk.get("messages", [])
-                if not msgs:
+            # Two stream modes at once: "messages" gives token-level deltas for
+            # live output; "values" gives full state snapshots so we can persist
+            # the final message list.
+            for mode, data in agent.stream(inputs, stream_mode=["values", "messages"]):
+                if mode == "values":
+                    final_state = data
                     continue
-                last = msgs[-1]
-                tool_calls = getattr(last, "tool_calls", None)
+                # mode == "messages": data is (message_chunk, metadata)
+                chunk, _meta = data
+                if getattr(chunk, "type", None) == "tool":
+                    status.write(f"✅ {getattr(chunk, 'name', 'tool')} returned")
+                    continue
+                tool_calls = getattr(chunk, "tool_call_chunks", None) or getattr(chunk, "tool_calls", None)
                 if tool_calls:
                     for tc in tool_calls:
-                        status.update(label=f"Calling tool: {tc.get('name', '?')}", state="running")
-                elif getattr(last, "type", None) == "tool":
-                    status.write(f"✅ {getattr(last, 'name', 'tool')} returned")
+                        name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+                        if name:
+                            status.update(label=f"Calling tool: {name}", state="running")
+                text = _chunk_text(getattr(chunk, "content", ""))
+                if text:
+                    answer += text
+                    placeholder.markdown(answer)
         except Exception as e:  # noqa: BLE001
+            import traceback
+
+            tb = traceback.format_exc()
+            # Always dump the full traceback to the console (run terminal) so the
+            # exact failing frame is visible, not just the exception message.
+            traceback.print_exc()
             status.update(label="Error", state="error")
             st.error(f"Agent error: {e}")
+            with st.expander("Show full traceback"):
+                st.code(tb, language="text")
             return
 
         status.update(label="Done", state="complete")
 
         if final_state is not None:
             st.session_state.lc_messages = final_state["messages"]
-            answer = ""
-            for m in reversed(final_state["messages"]):
-                if getattr(m, "type", None) == "ai" and getattr(m, "content", ""):
-                    answer = m.content
-                    break
-            st.markdown(answer or "_(no text response)_")
+            if not answer:
+                # Fallback if nothing streamed (e.g. non-streaming model).
+                for m in reversed(final_state["messages"]):
+                    if getattr(m, "type", None) == "ai" and getattr(m, "content", ""):
+                        answer = _chunk_text(m.content)
+                        break
+        placeholder.markdown(answer or "_(no text response)_")
 
 
 # =============================================================================
@@ -240,11 +333,7 @@ def main():
 
     # Build the agent; surface setup problems clearly without crashing.
     try:
-        agent = get_agent(
-            cfg.provider, cfg.model, cfg.base_url, cfg.api_key, cfg.temperature,
-            cfg.num_ctx, cfg.n_gpu_layers, cfg.n_threads, cfg.max_tokens, cfg.verbose,
-            str(cfg.models_dir),
-        )
+        agent = get_agent(cfg)
     except ImportError as e:
         st.warning(
             "The agent dependencies are not installed.\n\n"

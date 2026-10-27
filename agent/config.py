@@ -19,21 +19,48 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Where GGUF model files live (for the llamacpp provider / auto-detection).
-MODELS_DIR = Path(os.environ.get("GNPY_AGENT_MODELS_DIR", str(BASE_DIR / "models")))
 
-SUPPORTED_PROVIDERS = ("ollama", "openai", "llamacpp")
+def _flatten_content_to_text(content: Any) -> str:
+    """Collapse block-style (list) message content into a plain string.
+
+    LangChain/deepagents middleware (notably ``TodoListMiddleware``) rewrite the
+    system message ``content`` into a list of content blocks, e.g.
+    ``[{"type": "text", "text": "..."}]``. The legacy ``ChatLlamaCpp`` path hands
+    that list straight to ``llama_cpp.create_chat_completion``, but most GGUF
+    chat templates assume ``message["content"]`` is a string and concatenate it
+    directly (``content + "\n"``), raising
+    ``can only concatenate list (not "str") to list``. Joining the text blocks
+    keeps those templates working. Non-text blocks (images, tool_use, ...) are
+    dropped since llama.cpp text templates can't render them anyway.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+        return "".join(parts)
+    return "" if content is None else str(content)
+
+# Where GGUF model files live (for the llamacpp provider / auto-detection).
+MODELS_DIR = Path(os.environ.get("GNPY_AGENT_MODELS_DIR", str("C:\Haris\models")))
+
+SUPPORTED_PROVIDERS = ("llamacpp", "ollama", "openai")
 
 # Reasonable local defaults. Override via environment variables / the sidebar.
-DEFAULT_PROVIDER = "ollama"
+DEFAULT_PROVIDER = "llamacpp"
 DEFAULT_MODELS = {
     # A capable tool-calling model is required for the agent loop.
     "ollama": "qwen2.5:14b-instruct",
     "openai": "Qwen/Qwen2.5-14B-Instruct",
-    "llamacpp": "nvidia_Nemotron-Cascade-14B-Thinking-Q8_0.gguf",
+    "llamacpp": "Qwen_Qwen3.6-27B-Q6_K_L.gguf",
 }
 DEFAULT_BASE_URLS = {
     "ollama": "http://localhost:11434",
@@ -71,6 +98,10 @@ class AgentModelConfig:
     n_threads: int = max(4, (os.cpu_count() or 8) // 2)
     max_tokens: int = 2048
     verbose: bool = False  # llama.cpp logs to console (useful for load errors)
+    # Reasoning ("thinking") models emit a hidden <think>...</think> block before
+    # every answer, which is slow even for trivial prompts. When True we force
+    # the chat template's enable_thinking=False so the model replies directly.
+    disable_thinking: bool = True
     models_dir: Path = MODELS_DIR
 
     def __post_init__(self) -> None:
@@ -108,6 +139,8 @@ def config_from_env() -> AgentModelConfig:
         n_gpu_layers=int(os.getenv("GNPY_AGENT_N_GPU_LAYERS", "-1")),
         max_tokens=int(os.getenv("GNPY_AGENT_MAX_TOKENS", "2048")),
         verbose=os.getenv("GNPY_AGENT_VERBOSE", "").lower() in ("1", "true", "yes"),
+        disable_thinking=os.getenv("GNPY_AGENT_DISABLE_THINKING", "1").lower()
+        in ("1", "true", "yes"),
     )
 
 
@@ -187,12 +220,84 @@ def build_chat_model(cfg: AgentModelConfig | None = None):
         add_windows_llama_dll_dirs()
         try:
             from langchain_community.chat_models import ChatLlamaCpp
+            from langchain_core.messages import BaseMessage
         except ImportError as exc:  # pragma: no cover - environment dependent
             raise ImportError(
                 "langchain-community and llama-cpp-python are required for the "
                 "llamacpp provider. See requirements-agent.txt (install a "
                 "CUDA-enabled llama-cpp-python build for GPU)."
             ) from exc
+
+        from pydantic import model_validator
+
+        class _TextContentChatLlamaCpp(ChatLlamaCpp):
+            """ChatLlamaCpp tuned for the deepagents stack.
+
+            1. Flattens block-style (list) message content to plain strings,
+               since deepagents/LangChain middleware emit list-of-blocks content
+               that the GGUF Jinja chat template can't concatenate (tool calls
+               and ids are preserved via ``model_copy``).
+            2. Optionally forces the chat template's ``enable_thinking=False`` so
+               reasoning ("thinking") models answer directly instead of emitting
+               a slow hidden ``<think>`` block before every reply.
+            """
+
+            disable_thinking: bool = False
+
+            def _create_message_dicts(
+                self, messages: list[BaseMessage]
+            ) -> list[dict[str, Any]]:
+                flattened = [
+                    m.model_copy(update={"content": _flatten_content_to_text(m.content)})
+                    if isinstance(m.content, list)
+                    else m
+                    for m in messages
+                ]
+                return super()._create_message_dicts(flattened)
+
+            @model_validator(mode="after")
+            def _install_no_think_handler(self):  # type: ignore[no-untyped-def]
+                """Install a chat handler that pins ``enable_thinking=False``.
+
+                ``ChatLlamaCpp`` can't forward template variables through
+                ``create_chat_completion`` (fixed signature), so we replicate
+                llama.cpp's own Jinja handler from the model's embedded template
+                and inject the flag. Best-effort: any failure leaves the default
+                (thinking-enabled) behavior intact.
+                """
+                if not self.disable_thinking or self.client is None:
+                    return self
+                try:
+                    from llama_cpp import llama_chat_format
+
+                    metadata = getattr(self.client, "metadata", None) or {}
+                    template = metadata.get("tokenizer.chat_template")
+                    if not template or "enable_thinking" not in template:
+                        return self
+                    eos_id = self.client.token_eos()
+                    bos_id = self.client.token_bos()
+                    eos_token = (
+                        self.client._model.token_get_text(eos_id) if eos_id != -1 else ""
+                    )
+                    bos_token = (
+                        self.client._model.token_get_text(bos_id) if bos_id != -1 else ""
+                    )
+
+                    class _NoThinkFormatter(llama_chat_format.Jinja2ChatFormatter):
+                        def __call__(self, *, messages, **kw):  # type: ignore[no-untyped-def]
+                            kw.setdefault("enable_thinking", False)
+                            return super().__call__(messages=messages, **kw)
+
+                    self.client.chat_handler = _NoThinkFormatter(
+                        template=template,
+                        eos_token=eos_token,
+                        bos_token=bos_token,
+                        stop_token_ids=[eos_id],
+                    ).to_chat_handler()
+                except Exception:  # noqa: BLE001 - non-fatal optimization
+                    pass
+                return self
+
         model_path = cfg.resolve_model_path()
         if not model_path.exists():
             raise FileNotFoundError(
@@ -208,7 +313,7 @@ def build_chat_model(cfg: AgentModelConfig | None = None):
                 "Re-download the model; the file is likely truncated."
             )
         try:
-            return ChatLlamaCpp(
+            return _TextContentChatLlamaCpp(
                 model_path=str(model_path),
                 n_ctx=cfg.num_ctx,
                 n_gpu_layers=cfg.n_gpu_layers,
@@ -216,6 +321,7 @@ def build_chat_model(cfg: AgentModelConfig | None = None):
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
                 verbose=cfg.verbose,
+                disable_thinking=cfg.disable_thinking,
             )
         except Exception as exc:  # noqa: BLE001 - turn into an actionable message
             raise RuntimeError(
